@@ -1,2 +1,4 @@
 dataset/
 .venv/
+FnRGNN/
+GQNN_ckpt_fnr/
