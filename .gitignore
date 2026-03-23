@@ -1,4 +1,9 @@
-dataset/
 .venv/
-FnRGNN/
-GQNN_ckpt_fnr/
+
+data/NBA/
+data/NIFTY/
+data/pokec/
+
+results/
+
+ipynb/
