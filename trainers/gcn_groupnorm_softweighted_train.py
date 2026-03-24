@@ -2,11 +2,11 @@ import copy
 import pandas as pd
 import torch.nn as nn
 
-from models.gcn_groupnorm_selective_model import GCNGroupNormSelective
+from models.gcn_groupnorm_softweighted_model import GCNGroupNormSoftWeighted
 from utils.metrics import evaluate_pyg_model
 
 
-def train_gcn_groupnorm_selective_model(
+def train_gcn_groupnorm_softweighted_model(
     data,
     nfeat,
     hidden_dim=64,
@@ -17,9 +17,12 @@ def train_gcn_groupnorm_selective_model(
     drop_edge_rate=0.1,
     risk_weights=(1.0, 1.0, 1.0),
     priority_exponents=(1.0, 1.0),
-    priority_mode="topk",
-    priority_k_frac=0.2,
-    priority_threshold=None,
+    weight_transform="linear",
+    weight_power=1.0,
+    weight_temperature=1.0,
+    min_fair_weight=0.05,
+    normalize_fair_weights="mean1",
+    detach_fair_weights=True,
     lr=1e-3,
     weight_decay=1e-5,
     epochs=300,
@@ -36,7 +39,7 @@ def train_gcn_groupnorm_selective_model(
         if n_pos > 0:
             pos_weight = n_neg / max(n_pos, 1)
 
-    model = GCNGroupNormSelective(
+    model = GCNGroupNormSoftWeighted(
         nfeat=nfeat,
         hidden_dim=hidden_dim,
         dropout=dropout,
@@ -46,9 +49,12 @@ def train_gcn_groupnorm_selective_model(
         drop_edge_rate=drop_edge_rate,
         risk_weights=risk_weights,
         priority_exponents=priority_exponents,
-        priority_mode=priority_mode,
-        priority_k_frac=priority_k_frac,
-        priority_threshold=priority_threshold,
+        weight_transform=weight_transform,
+        weight_power=weight_power,
+        weight_temperature=weight_temperature,
+        min_fair_weight=min_fair_weight,
+        normalize_fair_weights=normalize_fair_weights,
+        detach_fair_weights=detach_fair_weights,
         lr=lr,
         weight_decay=weight_decay,
         pos_weight=pos_weight,
@@ -93,13 +99,13 @@ def train_gcn_groupnorm_selective_model(
 
         if epoch == 1 or epoch % verbose == 0:
             print(
-                f"[GCN+GroupNorm+Selective][{epoch:03d}] "
+                f"[GCN+GroupNorm+SoftWeighted][{epoch:03d}] "
                 f"loss={train_info['total_loss']:.4f} "
                 f"task={train_info['task_loss']:.4f} "
                 f"unc={train_info['unc_loss']:.4f} "
                 f"dist={train_info['dist_loss']:.4f} "
-                f"selected={train_info['selected_fair_count']} "
-                f"ratio={train_info['selected_fair_ratio']:.3f} | "
+                f"wavg={train_info['fair_weight_avg']:.4f} "
+                f"weff={train_info['fair_weight_effective_ratio']:.4f} | "
                 f"val_acc={val_result['acc']:.4f} "
                 f"val_f1={val_result['f1']:.4f} "
                 f"val_roc={val_result['roc_auc']:.4f} "

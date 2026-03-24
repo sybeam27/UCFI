@@ -4,33 +4,57 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 
 
-class GroupWiseNorm(nn.Module):
-    def __init__(self):
-        super().__init__()
+class WeightedGroupWiseNorm(nn.Module):
+    """
+    Weighted version of GroupWiseNorm.
 
-    def forward(self, pred_prob, sensitive_attr):
+    For each sensitive group g in {0,1}, compute:
+        weighted mean  = sum_i w_i p_i / sum_i w_i
+        weighted var   = sum_i w_i (p_i - mean_g)^2 / sum_i w_i
+
+    Final fairness distance:
+        |mean_0 - mean_1| + |var_0 - var_1|
+    """
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def _weighted_mean_var(self, x, w):
+        w_sum = w.sum().clamp(min=self.eps)
+        mean = (w * x).sum() / w_sum
+        var = (w * (x - mean).pow(2)).sum() / w_sum
+        return mean, var
+
+    def forward(self, pred_prob, sensitive_attr, weights):
         """
         pred_prob: [N, 1] or [N]
         sensitive_attr: [N], binary {0,1}
+        weights: [N], nonnegative
         """
         if pred_prob.dim() == 2 and pred_prob.size(1) == 1:
             pred_prob = pred_prob.squeeze(1)
 
+        weights = weights.view(-1).clamp(min=0.0)
+
         mask_0 = (sensitive_attr == 0)
         mask_1 = (sensitive_attr == 1)
 
+        if mask_0.sum() == 0 or mask_1.sum() == 0:
+            return torch.tensor(0.0, device=pred_prob.device)
+
         pred_0 = pred_prob[mask_0]
         pred_1 = pred_prob[mask_1]
+        w_0 = weights[mask_0]
+        w_1 = weights[mask_1]
 
-        zero = torch.tensor(0.0, device=pred_prob.device)
+        if w_0.sum() <= self.eps or w_1.sum() <= self.eps:
+            return torch.tensor(0.0, device=pred_prob.device)
 
-        if pred_0.numel() == 0 or pred_1.numel() == 0:
-            return zero
+        mean_0, var_0 = self._weighted_mean_var(pred_0, w_0)
+        mean_1, var_1 = self._weighted_mean_var(pred_1, w_1)
 
-        mean_diff = torch.abs(pred_0.mean() - pred_1.mean())
-        var_diff = torch.abs(
-            pred_0.var(unbiased=False) - pred_1.var(unbiased=False)
-        )
+        mean_diff = torch.abs(mean_0 - mean_1)
+        var_diff = torch.abs(var_0 - var_1)
 
         return mean_diff + var_diff
 
@@ -44,11 +68,16 @@ class StructuralUncertaintyHead(nn.Module):
         return F.softplus(self.fc(h)).squeeze(-1)  # [N], positive
 
 
-class GCNGroupNormSelective(nn.Module):
+class GCNGroupNormSoftWeighted(nn.Module):
     """
-    Baseline GCN + selective GroupWiseNorm.
-    Fairness loss is applied only on high-priority nodes
-    selected *within idx_sens_train*.
+    GCN + GroupNorm + soft-weighted fairness intervention.
+
+    Difference from hard selective version:
+    - do NOT select only top-k nodes
+    - apply fairness loss on all idx_sens_train nodes
+    - but assign node-wise weights using priority score
+
+    This is usually more stable than hard masking.
     """
     def __init__(
         self,
@@ -61,9 +90,12 @@ class GCNGroupNormSelective(nn.Module):
         drop_edge_rate=0.1,
         risk_weights=(1.0, 1.0, 1.0),
         priority_exponents=(1.0, 1.0),
-        priority_mode="topk",
-        priority_k_frac=0.2,
-        priority_threshold=None,
+        weight_transform="linear",          # ["linear", "power", "sigmoid", "softmax"]
+        weight_power=1.0,
+        weight_temperature=1.0,
+        min_fair_weight=0.05,               # avoid exact zero weights
+        normalize_fair_weights="mean1",     # ["none", "mean1", "sum1"]
+        detach_fair_weights=True,
         lr=1e-3,
         weight_decay=1e-5,
         pos_weight=None,
@@ -75,7 +107,7 @@ class GCNGroupNormSelective(nn.Module):
         self.classifier = nn.Linear(hidden_dim, 1)
 
         self.unc_head = StructuralUncertaintyHead(hidden_dim)
-        self.group_norm = GroupWiseNorm()
+        self.group_norm = WeightedGroupWiseNorm()
 
         self.dropout = dropout
         self.lambda_dist = lambda_dist
@@ -85,9 +117,13 @@ class GCNGroupNormSelective(nn.Module):
         self.drop_edge_rate = drop_edge_rate
         self.risk_weights = risk_weights
         self.priority_exponents = priority_exponents
-        self.priority_mode = priority_mode
-        self.priority_k_frac = priority_k_frac
-        self.priority_threshold = priority_threshold
+
+        self.weight_transform = weight_transform
+        self.weight_power = weight_power
+        self.weight_temperature = weight_temperature
+        self.min_fair_weight = min_fair_weight
+        self.normalize_fair_weights = normalize_fair_weights
+        self.detach_fair_weights = detach_fair_weights
 
         if pos_weight is not None and not torch.is_tensor(pos_weight):
             pos_weight = torch.tensor(float(pos_weight), dtype=torch.float32)
@@ -119,15 +155,12 @@ class GCNGroupNormSelective(nn.Module):
         uncertainty = self.unc_head(h)
 
         return {
-            "logits": y_logit,       # [N, 1]
-            "h": h,                  # [N, D]
+            "logits": y_logit,           # [N, 1]
+            "h": h,                      # [N, D]
             "uncertainty": uncertainty,  # [N]
         }
 
     def backbone_forward(self, features, edge_index):
-        """
-        Backbone-only forward for perturbation teacher.
-        """
         h = self.gcn1(features, edge_index)
         h = F.relu(h)
         h = F.dropout(h, self.dropout, training=self.training)
@@ -316,33 +349,54 @@ class GCNGroupNormSelective(nn.Module):
         }
         return priority, aux
 
-    @staticmethod
-    def make_subset_priority_mask(priority_subset, mode="topk", k_frac=0.2, threshold=None):
+    def priority_to_weights(self, priority_subset):
         """
-        Make mask within a subset, not whole node set.
-        priority_subset: [M]
-        returns: BoolTensor [M]
+        Convert normalized priority [0,1] into positive fairness weights.
         """
-        num_items = priority_subset.size(0)
-        device = priority_subset.device
+        if priority_subset.numel() == 0:
+            return priority_subset
 
-        if num_items == 0:
-            return torch.zeros(0, dtype=torch.bool, device=device)
+        p = priority_subset.clamp(min=0.0, max=1.0)
+        eps = 1e-8
 
-        if mode == "topk":
-            k = max(1, int(num_items * k_frac))
-            topk_idx = torch.topk(priority_subset, k=k, largest=True).indices
-            mask = torch.zeros(num_items, dtype=torch.bool, device=device)
-            mask[topk_idx] = True
-            return mask
+        if self.weight_transform == "linear":
+            w = p
 
-        elif mode == "threshold":
-            if threshold is None:
-                raise ValueError("threshold must be provided when mode='threshold'")
-            return priority_subset >= threshold
+        elif self.weight_transform == "power":
+            w = p.pow(self.weight_power)
+
+        elif self.weight_transform == "sigmoid":
+            # center at 0.5, temp controls steepness
+            temp = max(self.weight_temperature, eps)
+            w = torch.sigmoid((p - 0.5) / temp)
+
+        elif self.weight_transform == "softmax":
+            temp = max(self.weight_temperature, eps)
+            w = torch.softmax(p / temp, dim=0)
 
         else:
-            raise ValueError(f"Unknown mode: {mode}")
+            raise ValueError(
+                "weight_transform must be one of ['linear', 'power', 'sigmoid', 'softmax']"
+            )
+
+        # avoid exact zeros
+        w = self.min_fair_weight + (1.0 - self.min_fair_weight) * w
+
+        if self.normalize_fair_weights == "mean1":
+            w = w / (w.mean().clamp(min=eps))
+
+        elif self.normalize_fair_weights == "sum1":
+            w = w / (w.sum().clamp(min=eps))
+
+        elif self.normalize_fair_weights == "none":
+            pass
+
+        else:
+            raise ValueError(
+                "normalize_fair_weights must be one of ['none', 'mean1', 'sum1']"
+            )
+
+        return w
 
     @torch.no_grad()
     def compute_risk_and_priority(self, data):
@@ -440,28 +494,26 @@ class GCNGroupNormSelective(nn.Module):
 
         priority_pred, _ = self.compute_priority_score(
             static_risk=static_risk,
-            dynamic_uncertainty=pred_unc.detach(),
+            dynamic_uncertainty=pred_unc,
             alpha=self.priority_exponents[0],
             beta=self.priority_exponents[1],
             normalize_inputs=True,
             normalize_output=True,
         )
 
-        # 4) IMPORTANT: selection only within idx_sens_train
-        sens_priority = priority_pred[idx_sens_train]  # [M]
-        sens_priority_mask = self.make_subset_priority_mask(
-            sens_priority,
-            mode=self.priority_mode,
-            k_frac=self.priority_k_frac,
-            threshold=self.priority_threshold,
-        )
-        idx_fair = idx_sens_train[sens_priority_mask]
+        # 4) Soft fairness weights over ALL idx_sens_train
+        sens_priority = priority_pred[idx_sens_train]
 
-        # 5) Selective fairness loss
-        if idx_fair.numel() > 1:
-            y_prob_fair = torch.sigmoid(y_logit[idx_fair])
-            s_fair = sensitive_attr[idx_fair]
-            dist_loss = self.group_norm(y_prob_fair, s_fair)
+        if self.detach_fair_weights:
+            sens_priority = sens_priority.detach()
+
+        fair_weights = self.priority_to_weights(sens_priority)
+
+        # 5) Soft-weighted fairness loss
+        if idx_sens_train.numel() > 1:
+            y_prob_fair = torch.sigmoid(y_logit[idx_sens_train])
+            s_fair = sensitive_attr[idx_sens_train]
+            dist_loss = self.group_norm(y_prob_fair, s_fair, fair_weights)
         else:
             dist_loss = torch.tensor(0.0, device=y_logit.device)
 
@@ -470,18 +522,32 @@ class GCNGroupNormSelective(nn.Module):
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=5.0)
         self.optimizer.step()
 
-        selected_ratio = 0.0
-        if idx_sens_train.numel() > 0:
-            selected_ratio = idx_fair.numel() / float(idx_sens_train.numel())
+        # logging helpers
+        avg_fair_weight = float(fair_weights.mean().item()) if fair_weights.numel() > 0 else 0.0
+        max_fair_weight = float(fair_weights.max().item()) if fair_weights.numel() > 0 else 0.0
+        min_fair_weight = float(fair_weights.min().item()) if fair_weights.numel() > 0 else 0.0
+
+        # Kish effective sample size: tells how concentrated the weights are
+        if fair_weights.numel() > 0:
+            w_sum = fair_weights.sum()
+            w_sq_sum = fair_weights.pow(2).sum().clamp(min=1e-8)
+            eff_n = float((w_sum.pow(2) / w_sq_sum).item())
+            eff_ratio = eff_n / float(fair_weights.numel())
+        else:
+            eff_n = 0.0
+            eff_ratio = 0.0
 
         return {
             "total_loss": total_loss.item(),
             "task_loss": task_loss.item(),
             "unc_loss": unc_loss.item(),
             "dist_loss": dist_loss.item(),
-            "selected_fair_count": int(idx_fair.numel()),
-            "selected_fair_ratio": float(selected_ratio),
+            "fair_weight_avg": avg_fair_weight,
+            "fair_weight_min": min_fair_weight,
+            "fair_weight_max": max_fair_weight,
+            "fair_weight_effective_n": eff_n,
+            "fair_weight_effective_ratio": eff_ratio,
             "priority_mean_all": float(priority_pred.mean().item()),
-            "priority_mean_sens": float(sens_priority.mean().item()) if sens_priority.numel() > 0 else 0.0,
-            "priority_max_sens": float(sens_priority.max().item()) if sens_priority.numel() > 0 else 0.0,
+            "priority_mean_sens": float(priority_pred[idx_sens_train].mean().item()) if idx_sens_train.numel() > 0 else 0.0,
+            "priority_max_sens": float(priority_pred[idx_sens_train].max().item()) if idx_sens_train.numel() > 0 else 0.0,
         }

@@ -13,6 +13,7 @@ from trainers.gcn_mmd_train import train_gcn_mmd_model
 from trainers.gcn_mmd_groupnorm_train import train_gcn_mmd_groupnorm_model
 from trainers.fnrgnn_train import train_fnrgnn_model
 from trainers.gcn_groupnorm_selective_train import train_gcn_groupnorm_selective_model
+from trainers.gcn_groupnorm_softweighted_train import train_gcn_groupnorm_softweighted_model
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run GCN fairness experiments")
@@ -23,6 +24,7 @@ def parse_args():
                             "baseline_gcn",
                             "gcn_groupnorm",
                             "gcn_groupnorm_selective",
+                            "gcn_groupnorm_softweighted",
                             "gcn_mmd",
                             "gcn_mmd_groupnorm",
                             "fnrgnn",
@@ -85,6 +87,16 @@ def parse_args():
     parser.add_argument("--priority_mode", type=str, default="topk", choices=["topk", "threshold"])
     parser.add_argument("--priority_k_frac", type=float, default=0.2)
     parser.add_argument("--priority_threshold", type=float, default=None)
+
+    # soft
+    parser.add_argument("--weight_transform", type=str, default="linear",
+                    choices=["linear", "power", "sigmoid", "softmax"])
+    parser.add_argument("--weight_power", type=float, default=1.0)
+    parser.add_argument("--weight_temperature", type=float, default=1.0)
+    parser.add_argument("--min_fair_weight", type=float, default=0.05)
+    parser.add_argument("--normalize_fair_weights", type=str, default="mean1",
+                        choices=["none", "mean1", "sum1"])
+    parser.add_argument("--detach_fair_weights", action="store_true")
 
     return parser.parse_args()
 
@@ -238,6 +250,33 @@ def main():
             priority_mode=args.priority_mode,
             priority_k_frac=args.priority_k_frac,
             priority_threshold=args.priority_threshold,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            epochs=args.epochs,
+            verbose=args.verbose,
+            selection=args.selection,
+            use_pos_weight=args.use_pos_weight,
+            device=device,
+        )
+
+    elif args.model == "gcn_groupnorm_softweighted":
+        model, hist_df, val_result, test_result = train_gcn_groupnorm_softweighted_model(
+            data=pyg_data,
+            nfeat=nfeat,
+            hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+            lambda_dist=args.lambda_dist,
+            lambda_unc=args.lambda_unc,
+            num_perturbations=args.num_perturbations,
+            drop_edge_rate=args.drop_edge_rate,
+            risk_weights=(args.risk_boundary, args.risk_exposure, args.risk_influence),
+            priority_exponents=(args.priority_alpha, args.priority_beta),
+            weight_transform=args.weight_transform,
+            weight_power=args.weight_power,
+            weight_temperature=args.weight_temperature,
+            min_fair_weight=args.min_fair_weight,
+            normalize_fair_weights=args.normalize_fair_weights,
+            detach_fair_weights=args.detach_fair_weights,
             lr=args.lr,
             weight_decay=args.weight_decay,
             epochs=args.epochs,
