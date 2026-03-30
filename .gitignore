@@ -4,6 +4,10 @@ data/NBA/
 data/NIFTY/
 data/pokec/
 
-results/
-
 ipynb/
+models/
+
+outputs/
+results/
+src/
+trainers/

@@ -11,7 +11,6 @@ def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
 def scipy_adj_to_edge_index(adj: sp.spmatrix):
     if not sp.isspmatrix_coo(adj):
         adj = adj.tocoo()
@@ -19,7 +18,6 @@ def scipy_adj_to_edge_index(adj: sp.spmatrix):
     col = torch.LongTensor(adj.col)
     edge_index = torch.stack([row, col], dim=0)
     return edge_index
-
 
 def binarize_sensitive_attribute(sens: torch.Tensor, positive_value=None):
     sens_np = sens.detach().cpu().numpy()
@@ -35,7 +33,6 @@ def binarize_sensitive_attribute(sens: torch.Tensor, positive_value=None):
         sens_bin = (sens_np == positive_value).astype(np.float32)
 
     return torch.FloatTensor(sens_bin)
-
 
 def prepare_pyg_data(data_dict, device="cpu", sens_binary=True):
     x = data_dict["features"].float()
