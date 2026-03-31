@@ -180,16 +180,16 @@ def regression_fairness_metrics(preds, labels, sens, idx=None):
         return float(abs(a - b))
 
     return {
-        "mae_gap": _gap(g0["mae"], g1["mae"]),
         "mse_gap": _gap(g0["mse"], g1["mse"]),
         "rmse_gap": _gap(g0["rmse"], g1["rmse"]),
+        "mae_gap": _gap(g0["mae"], g1["mae"]),
 
         # 한 집단을 계속 과소/과대 예측하냐
         "bias_gap": _gap(g0["bias"], g1["bias"]),
         "mean_pred_gap": _gap(g0["mean_pred"], g1["mean_pred"]),
 
         # bias gap 중복 확인용
-        "mean_residual_gap": _gap(g0["mean_residual"], g1["mean_residual"]),
+        # "mean_residual_gap": _gap(g0["mean_residual"], g1["mean_residual"]),
         # "group_0": g0,
         # "group_1": g1,
     }

@@ -506,7 +506,9 @@ class FnCGNN(BaseMultiLevelFairGNN):
         acc = float(val_result.get("acc", 0.0))
         dp = abs(float(val_result.get("dp", 0.0)))
         eo = abs(float(val_result.get("eo", 0.0)))
-        return acc - self.val_tradeoff_dp * dp - self.val_tradeoff_eo * eo
+
+        # return acc - self.val_tradeoff_dp * dp - self.val_tradeoff_eo * eo
+        return acc - self.val_tradeoff_dp * dp
 
 
 # =========================================================
@@ -586,7 +588,7 @@ class FnRGNN(BaseMultiLevelFairGNN):
         return -(
             self.val_tradeoff_mae * mae
             + self.val_tradeoff_bias * bias_gap
-            + self.val_tradeoff_mean_pred * mean_pred_gap
+            # + self.val_tradeoff_mean_pred * mean_pred_gap
         )
 
 

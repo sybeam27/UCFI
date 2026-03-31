@@ -184,6 +184,7 @@ def run_classification_experiment(
     dataset_dict,
     device="cpu",
     backbones=("GCN", "GraphSAGE", "SGC"),
+    baseline = True,
     hidden_dim=64,
     dropout=0.1,
     sgc_k=2,
@@ -208,30 +209,31 @@ def run_classification_experiment(
         print(f"[Classification] Backbone = {backbone}")
         print("=" * 80)
 
-        baseline = BaselineGNN(
-            in_feats=data.x.size(1),
-            h_feats=hidden_dim,
-            device=device,
-            task_type="classification",
-            name=backbone,
-            dropout=dropout,
-            sgc_k=sgc_k,
-        )
-        baseline.fit(
-            data,
-            epochs=epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            patience=patience,
-            verbose=True,
-        )
-        baseline_test = baseline.evaluate(data, split="test")
-        results.append({
-            "task": "classification",
-            "model": "Baseline",
-            "backbone": backbone,
-            **baseline_test,
-        })
+        if baseline == True:
+            baseline = BaselineGNN(
+                in_feats=data.x.size(1),
+                h_feats=hidden_dim,
+                device=device,
+                task_type="classification",
+                name=backbone,
+                dropout=dropout,
+                sgc_k=sgc_k,
+            )
+            baseline.fit(
+                data,
+                epochs=epochs,
+                lr=lr,
+                weight_decay=weight_decay,
+                patience=patience,
+                verbose=True,
+            )
+            baseline_test = baseline.evaluate(data, split="test")
+            results.append({
+                "task": "classification",
+                "model": "Baseline",
+                "backbone": backbone,
+                **baseline_test,
+            })
 
         fnc = FnCGNN(
             in_feats=data.x.size(1),
@@ -273,6 +275,7 @@ def run_regression_experiment(
     dataset_dict,
     device="cpu",
     backbones=("GCN", "GraphSAGE", "SGC"),
+    baseline = True,
     hidden_dim=64,
     dropout=0.1,
     sgc_k=2,
@@ -297,30 +300,31 @@ def run_regression_experiment(
         print(f"[Regression] Backbone = {backbone}")
         print("=" * 80)
 
-        baseline = BaselineGNN(
-            in_feats=data.x.size(1),
-            h_feats=hidden_dim,
-            device=device,
-            task_type="regression",
-            name=backbone,
-            dropout=dropout,
-            sgc_k=sgc_k,
-        )
-        baseline.fit(
-            data,
-            epochs=epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            patience=patience,
-            verbose=True,
-        )
-        baseline_test = baseline.evaluate(data, split="test")
-        results.append({
-            "task": "regression",
-            "model": "Baseline",
-            "backbone": backbone,
-            **baseline_test,
-        })
+        if baseline == True:
+            baseline = BaselineGNN(
+                in_feats=data.x.size(1),
+                h_feats=hidden_dim,
+                device=device,
+                task_type="regression",
+                name=backbone,
+                dropout=dropout,
+                sgc_k=sgc_k,
+            )
+            baseline.fit(
+                data,
+                epochs=epochs,
+                lr=lr,
+                weight_decay=weight_decay,
+                patience=patience,
+                verbose=True,
+            )
+            baseline_test = baseline.evaluate(data, split="test")
+            results.append({
+                "task": "regression",
+                "model": "Baseline",
+                "backbone": backbone,
+                **baseline_test,
+            })
 
         fnr = FnRGNN(
             in_feats=data.x.size(1),
@@ -368,7 +372,10 @@ def parse_args():
     parser.add_argument("--task_type", type=str, required=True, choices=["classification", "regression"], )
     parser.add_argument("--dataset_name", type=str, required=True, choices=["pokec_z", "pokec_n", "nba", "german"],)
     parser.add_argument("--sens_attr", type=str, required=True, help="e.g. region / gender / country / Gender",)
-    parser.add_argument("--remove_leakage", action="store_true")
+    parser.add_argument("--remove_leakage", action="store_true")\
+    
+    parser.add_argument("--backbone", type=str, required=True, choices=["GCN", "GraphSAGE", "SGC"], )
+    parser.add_argument("--baseline", action="store_true")
 
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--hidden_dim", type=int, default=128)
@@ -377,7 +384,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--patience", type=int, default=100)
     parser.add_argument("--seed", type=int, default=27)
 
     return parser.parse_args()
@@ -427,7 +434,8 @@ if __name__ == "__main__":
         result_df = run_classification_experiment(
             dataset_dict=dataset_dict,
             device=args.device,
-            backbones=("GCN", "GraphSAGE", "SGC"),
+            backbones=args.backborn,
+            baseline=args.baseline,
             hidden_dim=args.hidden_dim,
             dropout=args.dropout,
             sgc_k=args.sgc_k,
@@ -442,7 +450,8 @@ if __name__ == "__main__":
         result_df = run_regression_experiment(
             dataset_dict=dataset_dict,
             device=args.device,
-            backbones=("GCN", "GraphSAGE", "SGC"),
+            backbones=args.backborn,
+            baseline=args.baseline,
             hidden_dim=args.hidden_dim,
             dropout=args.dropout,
             sgc_k=args.sgc_k,
