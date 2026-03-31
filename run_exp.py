@@ -312,7 +312,7 @@ def run_classification_experiment(
         **fnc_test,
     })
 
-    # ── NAFnRGNN 추가
+    # ── NAFnCGNN 추가
     na_fnc = NAFnCGNN(
         in_feats=data.x.size(1),
         h_feats=hidden_dim,
@@ -326,12 +326,10 @@ def run_classification_experiment(
         drop_edge_rate_struct=0.1,
         val_tradeoff_dp=0.3,
         val_tradeoff_eo=0.3,
-        hub_percentile=95,      # 80 → 95 (상위 5%만 허브)
-        isolate_percentile=10,  # 20 → 10 (하위 10%만 고립)
-        boundary_threshold=0.3, # 유지
-        hub_weight=2.0,
-        boundary_weight=1.5,
-        isolate_weight=0.5,
+        # 연속 노드 가중치 파라미터
+        alpha=0.5,       # degree : boundary = 5 : 5
+        min_weight=0.5,  # risk 최저 노드 가중치
+        max_weight=2.0,  # risk 최고 노드 가중치
     )
     na_fnc.fit(
         data,
@@ -462,6 +460,11 @@ def run_regression_experiment(
         val_tradeoff_mae=1.0,
         val_tradeoff_bias=1.0,
         val_tradeoff_mean_pred=0.5,
+
+        # 연속 노드 가중치 파라미터
+        alpha=0.5,       # degree : boundary = 5 : 5
+        min_weight=0.5,  # risk 최저 노드 가중치
+        max_weight=2.0,  # risk 최고 노드 가중치
     )
     na_fnr.fit(
         data,
@@ -478,7 +481,7 @@ def run_regression_experiment(
         "backbone": backbone,
         **na_fnr_test,
     })
-
+    
     return pd.DataFrame(results)
 
 
@@ -619,7 +622,8 @@ if __name__ == "__main__":
 
     # 저장: raw + summary 둘 다
     base_name = f"outputs/{args.dataset_name}_{args.task_type}_{args.sens_attr}_runs{args.runs}"
-    raw_df.to_csv(f"{base_name}_raw.csv", index=False)
+    # raw_df.to_csv(f"{base_name}_raw.csv", index=False)
+    # print(f"\nSaved: {base_name}_raw.csv")
+
     summary_df.to_csv(f"{base_name}_summary.csv", index=False)
-    print(f"\nSaved: {base_name}_raw.csv")
     print(f"Saved: {base_name}_summary.csv")

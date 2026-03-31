@@ -7,7 +7,13 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv, SAGEConv, SGConv
 
-from utils.metrics import evaluate_pyg_model
+from utils.metrics import (
+    classification_metrics,
+    classification_fairness_metrics,
+    regression_metrics,
+    regression_fairness_metrics,
+    evaluate_pyg_model,
+)
 
 
 # =========================================================
@@ -161,7 +167,6 @@ class GroupWiseNorm(nn.Module):
         # ↓ 추가: dim 평균이므로 이미 정규화됨, 추가 /dim 불필요
         # mean_diff, var_diff는 이미 dim 평균 → 스케일 안정적
         return mean_diff + var_diff  # 변경 없음 — 이미 정상
-
 
 def differentiable_dp_loss(prob, sensitive_attr, idx=None):
     if idx is not None:
@@ -590,32 +595,30 @@ class FnRGNN(BaseMultiLevelFairGNN):
         )
 
 
-
-
-
 # =========================================================
-# Node Risk Weight Computation
+# Node Risk Weight Computation (Continuous)
 # =========================================================
 def compute_node_risk_weights(
     data,
-    hub_percentile=80,
-    isolate_percentile=20,
-    boundary_threshold=0.3,
-    hub_weight=2.0,
-    boundary_weight=1.5,
-    isolate_weight=0.5,
-    default_weight=1.0,
+    alpha=0.5,        # degree 신호 vs boundary 신호 비중 (0=boundary only, 1=degree only)
+    min_weight=0.5,   # 최소 가중치 (risk가 가장 낮은 노드)
+    max_weight=2.0,   # 최대 가중치 (risk가 가장 높은 노드)
 ):
     """
-    그래프 구조 + sensitive attribute 기반 노드별 fairness 개입 가중치.
+    데이터셋 분포에 자동 적응하는 연속 노드 가중치 계산.
 
-    분류 기준:
-      허브 노드    : degree 상위 hub_percentile%         → hub_weight
-      경계 노드    : 타 그룹 이웃 비율 >= boundary_threshold → boundary_weight
-      고립 노드    : degree 하위 isolate_percentile%      → isolate_weight
-      일반 노드    : 나머지                               → default_weight
+    노드를 타입으로 분류하지 않고 degree와 boundary_ratio를
+    연속값으로 직접 가중치에 매핑.
 
-    우선순위: 허브 > 경계 > 고립 > 일반
+      w_degree   = normalize(log(deg + 1))    log 스케일로 heavy-tail 완화
+      w_boundary = normalize(boundary_ratio)  타 그룹 이웃 비율
+      w_raw      = alpha * w_degree + (1 - alpha) * w_boundary
+      weight     = min_weight + (max_weight - min_weight) * w_raw
+
+    파라미터:
+      alpha      : degree 신호 반영 비중. 0.5 = degree/boundary 동등
+      min_weight : risk가 가장 낮은 노드의 가중치
+      max_weight : risk가 가장 높은 노드의 가중치
 
     반환: weight [N] float tensor (detached 상수)
     """
@@ -626,29 +629,27 @@ def compute_node_risk_weights(
 
     ones = torch.ones(edge_index.size(1), device=device)
 
-    # degree
+    # ── degree 계산
     deg = torch.zeros(N, device=device)
     deg.scatter_add_(0, edge_index[0], ones)
 
-    # 허브 / 고립 마스크
-    hub_thresh     = torch.quantile(deg, hub_percentile / 100.0)
-    isolate_thresh = torch.quantile(deg, isolate_percentile / 100.0)
-    is_hub         = deg >= hub_thresh
-    is_isolate     = deg <= isolate_thresh
+    # ── log 스케일 degree → [0, 1] 정규화
+    # log1p로 heavy-tail에서 허브 노드의 과도한 지배를 완화
+    log_deg  = torch.log1p(deg)
+    w_degree = (log_deg - log_deg.min()) / (log_deg.max() - log_deg.min() + 1e-8)
 
-    # 경계 노드 마스크 (타 그룹 이웃 비율)
+    # ── boundary ratio → [0, 1] 정규화
     src, dst       = edge_index
     cross_edge     = (sens[src] != sens[dst]).float()
     cross_count    = torch.zeros(N, device=device)
     cross_count.scatter_add_(0, src, cross_edge)
     boundary_ratio = cross_count / (deg + 1e-8)
-    is_boundary    = boundary_ratio >= boundary_threshold
+    w_boundary     = (boundary_ratio - boundary_ratio.min()) / \
+                     (boundary_ratio.max() - boundary_ratio.min() + 1e-8)
 
-    # 가중치 할당 (우선순위 순서대로)
-    weight = torch.full((N,), default_weight, device=device)
-    weight[is_isolate]  = isolate_weight
-    weight[is_boundary] = boundary_weight
-    weight[is_hub]      = hub_weight
+    # ── 선형 결합 후 [min_weight, max_weight]로 스케일
+    w_raw  = alpha * w_degree + (1.0 - alpha) * w_boundary
+    weight = min_weight + (max_weight - min_weight) * w_raw
 
     return weight.detach()
 
@@ -760,10 +761,10 @@ def weighted_regression_fairness_loss(preds, labels, sensitive_attr, weight, idx
 class NodeAwareBase(BaseMultiLevelFairGNN):
     """
     BaseMultiLevelFairGNN을 상속하여
-    노드 유형별 차등 fairness 개입을 추가한 베이스 클래스.
+    연속 노드 가중치 기반 차등 fairness 개입을 추가한 베이스 클래스.
 
     변경된 부분:
-      - compute_node_risk_weights()로 학습 전 노드 가중치 1회 계산
+      - compute_node_risk_weights()로 학습 전 연속 가중치 1회 계산
       - compute_structure_loss: weighted MSE
       - compute_representation_loss: WeightedGroupWiseNorm
       - compute_output_loss: subclass에서 weighted loss 사용
@@ -772,25 +773,19 @@ class NodeAwareBase(BaseMultiLevelFairGNN):
         self,
         task_type,
         device,
-        hub_percentile=80,
-        isolate_percentile=20,
-        boundary_threshold=0.3,
-        hub_weight=2.0,
-        boundary_weight=1.5,
-        isolate_weight=0.5,
+        alpha=0.5,        # degree 신호 vs boundary 신호 비중
+        min_weight=0.5,   # 최소 가중치
+        max_weight=2.0,   # 최대 가중치
     ):
         super().__init__(task_type=task_type, device=device)
 
-        # 노드 분류 하이퍼파라미터
-        self.hub_percentile       = hub_percentile
-        self.isolate_percentile   = isolate_percentile
-        self.boundary_threshold   = boundary_threshold
-        self.hub_weight           = hub_weight
-        self.boundary_weight      = boundary_weight
-        self.isolate_weight       = isolate_weight
+        # 연속 가중치 하이퍼파라미터
+        self.alpha      = alpha
+        self.min_weight = min_weight
+        self.max_weight = max_weight
 
         # weighted group norm (기존 GroupWiseNorm 대체)
-        self.group_norm    = WeightedGroupWiseNorm()
+        self.group_norm = WeightedGroupWiseNorm()
 
         # 노드 가중치 캐시 (fit() 호출 시 초기화)
         self._node_weight: torch.Tensor | None = None
@@ -798,24 +793,17 @@ class NodeAwareBase(BaseMultiLevelFairGNN):
     def _build_node_weights(self, data):
         self._node_weight = compute_node_risk_weights(
             data,
-            hub_percentile      = self.hub_percentile,
-            isolate_percentile  = self.isolate_percentile,
-            boundary_threshold  = self.boundary_threshold,
-            hub_weight          = self.hub_weight,
-            boundary_weight     = self.boundary_weight,
-            isolate_weight      = self.isolate_weight,
+            alpha      = self.alpha,
+            min_weight = self.min_weight,
+            max_weight = self.max_weight,
         )
 
-        # 분포 확인용 로그
-        w          = self._node_weight
-        hub_n      = (w == self.hub_weight).sum().item()
-        boundary_n = (w == self.boundary_weight).sum().item()
-        isolate_n  = (w == self.isolate_weight).sum().item()
-        normal_n   = len(w) - hub_n - boundary_n - isolate_n
+        # 가중치 분포 로그
+        w = self._node_weight
         print(
             f"[{self.name}] NodeWeight | "
-            f"hub={hub_n} boundary={boundary_n} "
-            f"isolate={isolate_n} normal={normal_n}"
+            f"min={w.min():.3f} max={w.max():.3f} "
+            f"mean={w.mean():.3f} std={w.std():.3f}"
         )
 
     # ── Structure loss override
@@ -889,24 +877,17 @@ class NAFnCGNN(NodeAwareBase):
         ablate_out=False,
         val_tradeoff_dp=0.3,
         val_tradeoff_eo=0.3,
-        
-        # 노드 유형 하이퍼파라미터
-        hub_percentile=80,
-        isolate_percentile=20,
-        boundary_threshold=0.3,
-        hub_weight=2.0,
-        boundary_weight=1.5,
-        isolate_weight=0.5,
+        # 연속 노드 가중치 하이퍼파라미터
+        alpha=0.5,
+        min_weight=0.5,
+        max_weight=2.0,
     ):
         super().__init__(
-            task_type           = "classification",
-            device              = device,
-            hub_percentile      = hub_percentile,
-            isolate_percentile  = isolate_percentile,
-            boundary_threshold  = boundary_threshold,
-            hub_weight          = hub_weight,
-            boundary_weight     = boundary_weight,
-            isolate_weight      = isolate_weight,
+            task_type  = "classification",
+            device     = device,
+            alpha      = alpha,
+            min_weight = min_weight,
+            max_weight = max_weight,
         )
 
         assert name in ["GCN", "GraphSAGE", "SGC"], "지원하지 않는 모델입니다."
@@ -975,23 +956,17 @@ class NAFnRGNN(NodeAwareBase):
         val_tradeoff_mae=1.0,
         val_tradeoff_bias=1.0,
         val_tradeoff_mean_pred=0.5,
-        # 노드 유형 하이퍼파라미터
-        hub_percentile=80,
-        isolate_percentile=20,
-        boundary_threshold=0.3,
-        hub_weight=2.0,
-        boundary_weight=1.5,
-        isolate_weight=0.5,
+        # 연속 노드 가중치 하이퍼파라미터
+        alpha=0.5,
+        min_weight=0.5,
+        max_weight=2.0,
     ):
         super().__init__(
-            task_type           = "regression",
-            device              = device,
-            hub_percentile      = hub_percentile,
-            isolate_percentile  = isolate_percentile,
-            boundary_threshold  = boundary_threshold,
-            hub_weight          = hub_weight,
-            boundary_weight     = boundary_weight,
-            isolate_weight      = isolate_weight,
+            task_type  = "regression",
+            device     = device,
+            alpha      = alpha,
+            min_weight = min_weight,
+            max_weight = max_weight,
         )
 
         assert name in ["GCN", "GraphSAGE", "SGC"], "지원하지 않는 모델입니다."

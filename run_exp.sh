@@ -3,12 +3,12 @@ python run_exp.py \
     --task_type classification \
     --dataset_name pokec_z \
     --sens_attr region \
-    --remove_leakage --baseline \
+    --remove_leakage \
     --backbone GraphSAGE \
     --hidden_dim 256 \
     --dropout 0.5 \
     --device cuda:1 \
-    --runs 5
+    --runs 3
 
 python run_exp.py --task_type classification --dataset_name pokec_z --sens_attr gender --remove_leakage --backbone GraphSAGE --device cuda:1
 python run_exp.py --task_type classification --dataset_name pokec_n --sens_attr region --remove_leakage --backbone GraphSAGE --device cuda:1
