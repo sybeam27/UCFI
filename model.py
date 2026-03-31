@@ -7,13 +7,7 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv, SAGEConv, SGConv
 
-from utils.metrics import (
-    classification_metrics,
-    classification_fairness_metrics,
-    regression_metrics,
-    regression_fairness_metrics,
-    evaluate_pyg_model,
-)
+from utils.metrics import evaluate_pyg_model
 
 
 # =========================================================
@@ -158,14 +152,15 @@ class GroupWiseNorm(nn.Module):
 
         mean0 = z0.mean(dim=0)
         mean1 = z1.mean(dim=0)
-
-        var0 = z0.var(dim=0, unbiased=False)
-        var1 = z1.var(dim=0, unbiased=False)
+        var0  = z0.var(dim=0, unbiased=False)
+        var1  = z1.var(dim=0, unbiased=False)
 
         mean_diff = torch.abs(mean0 - mean1).mean()
-        var_diff = torch.abs(var0 - var1).mean()
+        var_diff  = torch.abs(var0  - var1 ).mean()
 
-        return mean_diff + var_diff
+        # ↓ 추가: dim 평균이므로 이미 정규화됨, 추가 /dim 불필요
+        # mean_diff, var_diff는 이미 dim 평균 → 스케일 안정적
+        return mean_diff + var_diff  # 변경 없음 — 이미 정상
 
 
 def differentiable_dp_loss(prob, sensitive_attr, idx=None):
@@ -268,7 +263,7 @@ class BaseMultiLevelFairGNN:
         return torch.optim.Adam(
             self.model.parameters(),
             lr=lr,
-            weight_decay=weight_decay,
+            weight_decay=weight_decay if weight_decay is not None else 0.0,
         )
 
     def _get_fair_idx(self, data):
@@ -289,64 +284,69 @@ class BaseMultiLevelFairGNN:
             keep_mask[torch.randint(0, num_edges, (1,), device=device)] = True
 
         return edge_index[:, keep_mask]
-
+    
     def compute_structure_loss(self, data, h_orig):
+        idx_fair  = self._get_fair_idx(data)
         edge_pert = self.perturb_edge_index(
             data.edge_index,
             drop_rate=self.drop_edge_rate_struct,
         )
         _, h_pert = self.model(data, edge_index=edge_pert, return_hidden=True)
-        return F.mse_loss(h_orig, h_pert)
+        
+        # hidden dim으로 나눠서 스케일 정규화
+        # MSE 평균이 dim에 비례하므로 dim으로 나누면 항상 ~O(1) 스케일
+        dim = h_orig.size(-1)
+        return F.mse_loss(h_orig[idx_fair], h_pert[idx_fair]) / dim
 
     def compute_representation_loss(self, h, sensitive_attr, idx_fair):
-        return self.group_norm(h, sensitive_attr, idx=idx_fair)
+        h_train   = h[idx_fair]                      # train 노드만 명시적으로 분리
+        sens_train = sensitive_attr[idx_fair]        # 대응하는 sensitive attr도 분리
+        return self.group_norm(h_train, sens_train)  # idx 인자 불필요
 
     def train_step(self, data, optimizer, criterion):
         self.model.train()
         optimizer.zero_grad()
 
-        labels = data.y.float()
-        idx_train = data.idx_train
-        idx_fair = self._get_fair_idx(data)
+        labels        = data.y.float()
+        idx_train     = data.idx_train
+        idx_fair      = self._get_fair_idx(data)
         sensitive_attr = data.sensitive_attr
 
         preds_or_logits, h = self.model(data, return_hidden=True)
-
         task_loss = criterion(preds_or_logits[idx_train], labels[idx_train])
 
         struct_loss = preds_or_logits.new_tensor(0.0)
         if not self.ablate_struct:
             struct_loss = self.compute_structure_loss(data, h)
+            # 별도 스케일링 불필요 — compute_structure_loss 내부에서 처리
 
         rep_loss = preds_or_logits.new_tensor(0.0)
         if not self.ablate_rep:
             rep_loss = self.compute_representation_loss(h, sensitive_attr, idx_fair)
+            # rep loss (GroupWiseNorm)도 dim 정규화 적용
 
         out_loss = preds_or_logits.new_tensor(0.0)
         if not self.ablate_out:
             out_loss = self.compute_output_loss(
-                preds_or_logits,
-                labels,
-                sensitive_attr,
-                idx_fair,
+                preds_or_logits, labels, sensitive_attr, idx_fair
             )
 
         total_loss = (
             task_loss
             + self.lambda_struct * struct_loss
-            + self.lambda_rep * rep_loss
-            + self.lambda_out * out_loss
+            + self.lambda_rep    * rep_loss
+            + self.lambda_out    * out_loss
         )
 
         total_loss.backward()
         optimizer.step()
 
         return {
-            "total_loss": float(total_loss.item()),
-            "task_loss": float(task_loss.item()),
+            "total_loss":  float(total_loss.item()),
+            "task_loss":   float(task_loss.item()),
             "struct_loss": float(struct_loss.item()),
-            "rep_loss": float(rep_loss.item()),
-            "out_loss": float(out_loss.item()),
+            "rep_loss":    float(rep_loss.item()),
+            "out_loss":    float(out_loss.item()),
         }
 
     def fit(
@@ -507,8 +507,7 @@ class FnCGNN(BaseMultiLevelFairGNN):
         dp = abs(float(val_result.get("dp", 0.0)))
         eo = abs(float(val_result.get("eo", 0.0)))
 
-        # return acc - self.val_tradeoff_dp * dp - self.val_tradeoff_eo * eo
-        return acc - self.val_tradeoff_dp * dp
+        return acc - self.val_tradeoff_dp * dp - self.val_tradeoff_eo * eo
 
 
 # =========================================================
@@ -581,105 +580,469 @@ class FnRGNN(BaseMultiLevelFairGNN):
         )
 
     def _compute_val_score(self, val_result):
-        mae = float(val_result.get("mae", float("inf")))
-        bias_gap = abs(float(val_result.get("bias_gap", 0.0)))
+        mae           = float(val_result.get("mae", float("inf")))
+        bias_gap      = abs(float(val_result.get("bias_gap", 0.0)))
         mean_pred_gap = abs(float(val_result.get("mean_pred_gap", 0.0)))
-
         return -(
-            self.val_tradeoff_mae * mae
-            + self.val_tradeoff_bias * bias_gap
-            # + self.val_tradeoff_mean_pred * mean_pred_gap
+            self.val_tradeoff_mae      * mae
+            + self.val_tradeoff_bias   * bias_gap
+            + self.val_tradeoff_mean_pred * mean_pred_gap  # 주석 해제
+        )
+
+
+
+
+
+# =========================================================
+# Node Risk Weight Computation
+# =========================================================
+def compute_node_risk_weights(
+    data,
+    hub_percentile=80,
+    isolate_percentile=20,
+    boundary_threshold=0.3,
+    hub_weight=2.0,
+    boundary_weight=1.5,
+    isolate_weight=0.5,
+    default_weight=1.0,
+):
+    """
+    그래프 구조 + sensitive attribute 기반 노드별 fairness 개입 가중치.
+
+    분류 기준:
+      허브 노드    : degree 상위 hub_percentile%         → hub_weight
+      경계 노드    : 타 그룹 이웃 비율 >= boundary_threshold → boundary_weight
+      고립 노드    : degree 하위 isolate_percentile%      → isolate_weight
+      일반 노드    : 나머지                               → default_weight
+
+    우선순위: 허브 > 경계 > 고립 > 일반
+
+    반환: weight [N] float tensor (detached 상수)
+    """
+    edge_index = data.edge_index
+    sens       = data.sensitive_attr
+    N          = data.x.size(0)
+    device     = data.x.device
+
+    ones = torch.ones(edge_index.size(1), device=device)
+
+    # degree
+    deg = torch.zeros(N, device=device)
+    deg.scatter_add_(0, edge_index[0], ones)
+
+    # 허브 / 고립 마스크
+    hub_thresh     = torch.quantile(deg, hub_percentile / 100.0)
+    isolate_thresh = torch.quantile(deg, isolate_percentile / 100.0)
+    is_hub         = deg >= hub_thresh
+    is_isolate     = deg <= isolate_thresh
+
+    # 경계 노드 마스크 (타 그룹 이웃 비율)
+    src, dst       = edge_index
+    cross_edge     = (sens[src] != sens[dst]).float()
+    cross_count    = torch.zeros(N, device=device)
+    cross_count.scatter_add_(0, src, cross_edge)
+    boundary_ratio = cross_count / (deg + 1e-8)
+    is_boundary    = boundary_ratio >= boundary_threshold
+
+    # 가중치 할당 (우선순위 순서대로)
+    weight = torch.full((N,), default_weight, device=device)
+    weight[is_isolate]  = isolate_weight
+    weight[is_boundary] = boundary_weight
+    weight[is_hub]      = hub_weight
+
+    return weight.detach()
+
+
+# =========================================================
+# Weighted Fairness Loss Functions
+# =========================================================
+class WeightedGroupWiseNorm(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, z, sensitive_attr, weight, idx=None):
+        if idx is not None:
+            z              = z[idx]
+            sensitive_attr = sensitive_attr[idx]
+            weight         = weight[idx]
+
+        if z.dim() == 1:
+            z = z.unsqueeze(1)
+
+        weight = weight / (weight.mean() + 1e-8)
+        w      = weight.unsqueeze(1)
+
+        mask_0 = (sensitive_attr == 0)
+        mask_1 = (sensitive_attr == 1)
+
+        if mask_0.sum() == 0 or mask_1.sum() == 0:
+            return z.new_tensor(0.0)
+
+        z0, w0 = z[mask_0], w[mask_0]
+        z1, w1 = z[mask_1], w[mask_1]
+
+        mean0 = (z0 * w0).sum(dim=0) / (w0.sum() + 1e-8)
+        mean1 = (z1 * w1).sum(dim=0) / (w1.sum() + 1e-8)
+        var0  = ((z0 - mean0) ** 2 * w0).sum(dim=0) / (w0.sum() + 1e-8)
+        var1  = ((z1 - mean1) ** 2 * w1).sum(dim=0) / (w1.sum() + 1e-8)
+
+        return torch.abs(mean0 - mean1).mean() + torch.abs(var0 - var1).mean()
+
+def weighted_dp_loss(prob, sensitive_attr, weight, idx=None):
+    if idx is not None:
+        prob           = prob[idx]
+        sensitive_attr = sensitive_attr[idx]
+        weight         = weight[idx]
+
+    weight = weight / (weight.mean() + 1e-8)
+    mask_0 = (sensitive_attr == 0)
+    mask_1 = (sensitive_attr == 1)
+
+    if mask_0.sum() == 0 or mask_1.sum() == 0:
+        return prob.new_tensor(0.0)
+
+    p0 = (prob[mask_0] * weight[mask_0]).sum() / (weight[mask_0].sum() + 1e-8)
+    p1 = (prob[mask_1] * weight[mask_1]).sum() / (weight[mask_1].sum() + 1e-8)
+    return torch.abs(p0 - p1)
+
+def weighted_eo_loss(prob, labels, sensitive_attr, weight, idx=None):
+    if idx is not None:
+        prob           = prob[idx]
+        labels         = labels[idx]
+        sensitive_attr = sensitive_attr[idx]
+        weight         = weight[idx]
+
+    labels = labels.float()
+    weight = weight / (weight.mean() + 1e-8)
+
+    mask_0_y1 = (sensitive_attr == 0) & (labels == 1)
+    mask_1_y1 = (sensitive_attr == 1) & (labels == 1)
+
+    if mask_0_y1.sum() == 0 or mask_1_y1.sum() == 0:
+        return prob.new_tensor(0.0)
+
+    eo0 = (prob[mask_0_y1] * weight[mask_0_y1]).sum() / (weight[mask_0_y1].sum() + 1e-8)
+    eo1 = (prob[mask_1_y1] * weight[mask_1_y1]).sum() / (weight[mask_1_y1].sum() + 1e-8)
+    return torch.abs(eo0 - eo1)
+
+def weighted_regression_fairness_loss(preds, labels, sensitive_attr, weight, idx=None):
+    if idx is not None:
+        preds          = preds[idx]
+        labels         = labels[idx]
+        sensitive_attr = sensitive_attr[idx]
+        weight         = weight[idx]
+
+    weight = weight / (weight.mean() + 1e-8)
+    mask_0 = (sensitive_attr == 0)
+    mask_1 = (sensitive_attr == 1)
+
+    if mask_0.sum() == 0 or mask_1.sum() == 0:
+        return preds.new_tensor(0.0)
+
+    pred0, w0 = preds[mask_0], weight[mask_0]
+    pred1, w1 = preds[mask_1], weight[mask_1]
+    y0, y1    = labels[mask_0], labels[mask_1]
+
+    mean_pred0    = (pred0 * w0).sum() / (w0.sum() + 1e-8)
+    mean_pred1    = (pred1 * w1).sum() / (w1.sum() + 1e-8)
+    mean_pred_gap = torch.abs(mean_pred0 - mean_pred1)
+
+    bias0    = ((pred0 - y0) * w0).sum() / (w0.sum() + 1e-8)
+    bias1    = ((pred1 - y1) * w1).sum() / (w1.sum() + 1e-8)
+    bias_gap = torch.abs(bias0 - bias1)
+
+    return mean_pred_gap + bias_gap
+
+
+# =========================================================
+# NodeAwareBase: 노드 유형 인식 공통 베이스
+# =========================================================
+class NodeAwareBase(BaseMultiLevelFairGNN):
+    """
+    BaseMultiLevelFairGNN을 상속하여
+    노드 유형별 차등 fairness 개입을 추가한 베이스 클래스.
+
+    변경된 부분:
+      - compute_node_risk_weights()로 학습 전 노드 가중치 1회 계산
+      - compute_structure_loss: weighted MSE
+      - compute_representation_loss: WeightedGroupWiseNorm
+      - compute_output_loss: subclass에서 weighted loss 사용
+    """
+    def __init__(
+        self,
+        task_type,
+        device,
+        hub_percentile=80,
+        isolate_percentile=20,
+        boundary_threshold=0.3,
+        hub_weight=2.0,
+        boundary_weight=1.5,
+        isolate_weight=0.5,
+    ):
+        super().__init__(task_type=task_type, device=device)
+
+        # 노드 분류 하이퍼파라미터
+        self.hub_percentile       = hub_percentile
+        self.isolate_percentile   = isolate_percentile
+        self.boundary_threshold   = boundary_threshold
+        self.hub_weight           = hub_weight
+        self.boundary_weight      = boundary_weight
+        self.isolate_weight       = isolate_weight
+
+        # weighted group norm (기존 GroupWiseNorm 대체)
+        self.group_norm    = WeightedGroupWiseNorm()
+
+        # 노드 가중치 캐시 (fit() 호출 시 초기화)
+        self._node_weight: torch.Tensor | None = None
+
+    def _build_node_weights(self, data):
+        self._node_weight = compute_node_risk_weights(
+            data,
+            hub_percentile      = self.hub_percentile,
+            isolate_percentile  = self.isolate_percentile,
+            boundary_threshold  = self.boundary_threshold,
+            hub_weight          = self.hub_weight,
+            boundary_weight     = self.boundary_weight,
+            isolate_weight      = self.isolate_weight,
+        )
+
+        # 분포 확인용 로그
+        w          = self._node_weight
+        hub_n      = (w == self.hub_weight).sum().item()
+        boundary_n = (w == self.boundary_weight).sum().item()
+        isolate_n  = (w == self.isolate_weight).sum().item()
+        normal_n   = len(w) - hub_n - boundary_n - isolate_n
+        print(
+            f"[{self.name}] NodeWeight | "
+            f"hub={hub_n} boundary={boundary_n} "
+            f"isolate={isolate_n} normal={normal_n}"
+        )
+
+    # ── Structure loss override
+    def compute_structure_loss(self, data, h_orig):
+        idx_fair  = self._get_fair_idx(data)
+        edge_pert = self.perturb_edge_index(
+            data.edge_index,
+            drop_rate=self.drop_edge_rate_struct,
+        )
+        _, h_pert = self.model(data, edge_index=edge_pert, return_hidden=True)
+
+        dim  = h_orig.size(-1)
+        w    = self._node_weight[idx_fair]
+        w    = w / (w.mean() + 1e-8)
+
+        node_mse = ((h_orig[idx_fair] - h_pert[idx_fair]) ** 2).mean(dim=-1)
+        return (node_mse * w).mean() / dim
+
+    # ── Representation loss override
+    def compute_representation_loss(self, h, sensitive_attr, idx_fair):
+        return self.group_norm(
+            h, sensitive_attr,
+            weight=self._node_weight,
+            idx=idx_fair,
+        )
+
+    # ── fit() override: 노드 가중치 계산 추가
+    def fit(
+        self,
+        data,
+        epochs=1000,
+        lr=1e-3,
+        weight_decay=0.0,
+        patience=50,
+        verbose=True,
+        print_interval=50,
+    ):
+        # 학습 전 노드 가중치 1회 계산
+        self._build_node_weights(data)
+
+        # 이후는 부모 fit() 그대로
+        super().fit(
+            data=data,
+            epochs=epochs,
+            lr=lr,
+            weight_decay=weight_decay,
+            patience=patience,
+            verbose=verbose,
+            print_interval=print_interval,
         )
 
 
 # =========================================================
-# Optional Helpers
+# NAFnCGNN: Node-Aware Fair Classification GNN
 # =========================================================
-def train_fncgnn_model(
-    data,
-    nfeat,
-    hidden_dim=64,
-    device="cpu",
-    backbone="GCN",
-    dropout=0.1,
-    sgc_k=2,
-    lambda_struct=0.01,
-    lambda_rep=0.05,
-    lambda_out=0.05,
-    drop_edge_rate_struct=0.15,
-    lr=1e-3,
-    weight_decay=0.0,
-    epochs=300,
-    patience=50,
-    verbose=True,
-):
-    model = FnCGNN(
-        in_feats=nfeat,
-        h_feats=hidden_dim,
-        device=device,
-        name=backbone,
-        dropout=dropout,
-        sgc_k=sgc_k,
-        lambda_struct=lambda_struct,
-        lambda_rep=lambda_rep,
-        lambda_out=lambda_out,
-        drop_edge_rate_struct=drop_edge_rate_struct,
-    )
+class NAFnCGNN(NodeAwareBase):
+    def __init__(
+        self,
+        in_feats,
+        h_feats,
+        device,
+        name="GCN",
+        dropout=0.1,
+        sgc_k=2,
+        lambda_struct=0.001,
+        lambda_rep=0.01,
+        lambda_out=0.1,
+        drop_edge_rate_struct=0.1,
+        ablate_struct=False,
+        ablate_rep=False,
+        ablate_out=False,
+        val_tradeoff_dp=0.3,
+        val_tradeoff_eo=0.3,
+        
+        # 노드 유형 하이퍼파라미터
+        hub_percentile=80,
+        isolate_percentile=20,
+        boundary_threshold=0.3,
+        hub_weight=2.0,
+        boundary_weight=1.5,
+        isolate_weight=0.5,
+    ):
+        super().__init__(
+            task_type           = "classification",
+            device              = device,
+            hub_percentile      = hub_percentile,
+            isolate_percentile  = isolate_percentile,
+            boundary_threshold  = boundary_threshold,
+            hub_weight          = hub_weight,
+            boundary_weight     = boundary_weight,
+            isolate_weight      = isolate_weight,
+        )
 
-    model.fit(
-        data,
-        epochs=epochs,
-        lr=lr,
-        weight_decay=weight_decay,
-        patience=patience,
-        verbose=verbose,
-    )
+        assert name in ["GCN", "GraphSAGE", "SGC"], "지원하지 않는 모델입니다."
+        self.name = f"{name}/NAFnCGNN"
 
-    final_test = model.evaluate(data, split="test")
-    return model, final_test
+        self.in_feats             = in_feats
+        self.h_feats              = h_feats
+        self.backbone_name        = name
+        self.dropout              = dropout
+        self.sgc_k                = sgc_k
+        self.lambda_struct        = lambda_struct
+        self.lambda_rep           = lambda_rep
+        self.lambda_out           = lambda_out
+        self.drop_edge_rate_struct = drop_edge_rate_struct
+        self.ablate_struct        = ablate_struct
+        self.ablate_rep           = ablate_rep
+        self.ablate_out           = ablate_out
+        self.val_tradeoff_dp      = val_tradeoff_dp
+        self.val_tradeoff_eo      = val_tradeoff_eo
 
-def train_fnrgnn_model(
-    data,
-    nfeat,
-    hidden_dim=64,
-    device="cpu",
-    backbone="GCN",
-    dropout=0.1,
-    sgc_k=2,
-    lambda_struct=0.01,
-    lambda_rep=0.05,
-    lambda_out=0.05,
-    drop_edge_rate_struct=0.15,
-    lr=1e-3,
-    weight_decay=1e-5,
-    epochs=300,
-    patience=50,
-    verbose=True,
-):
-    model = FnRGNN(
-        in_feats=nfeat,
-        h_feats=hidden_dim,
-        device=device,
-        name=backbone,
-        dropout=dropout,
-        sgc_k=sgc_k,
-        lambda_struct=lambda_struct,
-        lambda_rep=lambda_rep,
-        lambda_out=lambda_out,
-        drop_edge_rate_struct=drop_edge_rate_struct,
-    )
+        self.model = self._build_model().to(device)
 
-    model.fit(
-        data,
-        epochs=epochs,
-        lr=lr,
-        weight_decay=weight_decay,
-        patience=patience,
-        verbose=verbose,
-    )
+    def _build_model(self):
+        return build_backbone(
+            name     = self.backbone_name,
+            in_feats = self.in_feats,
+            h_feats  = self.h_feats,
+            dropout  = self.dropout,
+            sgc_k    = self.sgc_k,
+        )
 
-    final_test = model.evaluate(data, split="test")
-    return model, final_test
+    def _build_criterion(self):
+        return nn.BCEWithLogitsLoss()
+
+    def compute_output_loss(self, logits, labels, sensitive_attr, idx_fair):
+        prob    = torch.sigmoid(logits)
+        dp_loss = weighted_dp_loss(prob, sensitive_attr, self._node_weight, idx=idx_fair)
+        eo_loss = weighted_eo_loss(prob, labels, sensitive_attr, self._node_weight, idx=idx_fair)
+        return dp_loss + eo_loss
+
+    def _compute_val_score(self, val_result):
+        acc = float(val_result.get("acc", 0.0))
+        dp  = abs(float(val_result.get("dp", 0.0)))
+        eo  = abs(float(val_result.get("eo", 0.0)))
+        return acc - self.val_tradeoff_dp * dp - self.val_tradeoff_eo * eo
+
+# =========================================================
+# NAFnRGNN: Node-Aware Fair Regression GNN
+# =========================================================
+class NAFnRGNN(NodeAwareBase):
+    def __init__(
+        self,
+        in_feats,
+        h_feats,
+        device,
+        name="GCN",
+        dropout=0.1,
+        sgc_k=2,
+        lambda_struct=0.001,
+        lambda_rep=0.01,
+        lambda_out=0.1,
+        drop_edge_rate_struct=0.1,
+        ablate_struct=False,
+        ablate_rep=False,
+        ablate_out=False,
+        val_tradeoff_mae=1.0,
+        val_tradeoff_bias=1.0,
+        val_tradeoff_mean_pred=0.5,
+        # 노드 유형 하이퍼파라미터
+        hub_percentile=80,
+        isolate_percentile=20,
+        boundary_threshold=0.3,
+        hub_weight=2.0,
+        boundary_weight=1.5,
+        isolate_weight=0.5,
+    ):
+        super().__init__(
+            task_type           = "regression",
+            device              = device,
+            hub_percentile      = hub_percentile,
+            isolate_percentile  = isolate_percentile,
+            boundary_threshold  = boundary_threshold,
+            hub_weight          = hub_weight,
+            boundary_weight     = boundary_weight,
+            isolate_weight      = isolate_weight,
+        )
+
+        assert name in ["GCN", "GraphSAGE", "SGC"], "지원하지 않는 모델입니다."
+        self.name = f"{name}/NAFnRGNN"
+
+        self.in_feats              = in_feats
+        self.h_feats               = h_feats
+        self.backbone_name         = name
+        self.dropout               = dropout
+        self.sgc_k                 = sgc_k
+        self.lambda_struct         = lambda_struct
+        self.lambda_rep            = lambda_rep
+        self.lambda_out            = lambda_out
+        self.drop_edge_rate_struct = drop_edge_rate_struct
+        self.ablate_struct         = ablate_struct
+        self.ablate_rep            = ablate_rep
+        self.ablate_out            = ablate_out
+        self.val_tradeoff_mae      = val_tradeoff_mae
+        self.val_tradeoff_bias     = val_tradeoff_bias
+        self.val_tradeoff_mean_pred = val_tradeoff_mean_pred
+
+        self.model = self._build_model().to(device)
+
+    def _build_model(self):
+        return build_backbone(
+            name     = self.backbone_name,
+            in_feats = self.in_feats,
+            h_feats  = self.h_feats,
+            dropout  = self.dropout,
+            sgc_k    = self.sgc_k,
+        )
+
+    def _build_criterion(self):
+        return nn.MSELoss()
+
+    def compute_output_loss(self, preds, labels, sensitive_attr, idx_fair):
+        return weighted_regression_fairness_loss(
+            preds, labels, sensitive_attr, self._node_weight, idx=idx_fair
+        )
+
+    def _compute_val_score(self, val_result):
+        mae           = float(val_result.get("mae", float("inf")))
+        bias_gap      = abs(float(val_result.get("bias_gap", 0.0)))
+        mean_pred_gap = abs(float(val_result.get("mean_pred_gap", 0.0)))
+        return -(
+            self.val_tradeoff_mae       * mae
+            + self.val_tradeoff_bias    * bias_gap
+            + self.val_tradeoff_mean_pred * mean_pred_gap
+        )
+
+
 
 
 

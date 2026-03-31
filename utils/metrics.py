@@ -91,7 +91,7 @@ def regression_metrics(preds, labels):
         r2 = float("nan")
 
     return {
-        "mse": float(mse),
+        # "mse": float(mse),
         "rmse": float(rmse),
         "mae": float(mae),
         "r2": float(r2),
@@ -180,7 +180,7 @@ def regression_fairness_metrics(preds, labels, sens, idx=None):
         return float(abs(a - b))
 
     return {
-        "mse_gap": _gap(g0["mse"], g1["mse"]),
+        # "mse_gap": _gap(g0["mse"], g1["mse"]),
         "rmse_gap": _gap(g0["rmse"], g1["rmse"]),
         "mae_gap": _gap(g0["mae"], g1["mae"]),
 
