@@ -16,9 +16,7 @@ from utils.metrics import (
 )
 
 
-# =========================================================
 # Loader output -> PyG Data
-# =========================================================
 def build_pyg_data_from_loader_dict(dataset_dict, device, task_type="classification"):
     adj = dataset_dict["adj"]
     if not sp.isspmatrix(adj):
@@ -595,51 +593,53 @@ class FnRGNN(BaseMultiLevelFairGNN):
         )
 
 
+
+
+
 # =========================================================
-# Node Risk Weight Computation (Continuous)
+# Structural Bias Risk Score (SBRS) Computation
 # =========================================================
-def compute_node_risk_weights(
-    data,
-    alpha=0.5,        # degree 신호 vs boundary 신호 비중 (0=boundary only, 1=degree only)
-    min_weight=0.5,   # 최소 가중치 (risk가 가장 낮은 노드)
-    max_weight=2.0,   # 최대 가중치 (risk가 가장 높은 노드)
-):
+def compute_sbrs(data, alpha=0.34, beta=0.33, gamma=0.33):
     """
-    데이터셋 분포에 자동 적응하는 연속 노드 가중치 계산.
+    그래프 구조 기반 Structural Bias Risk Score (SBRS) 계산.
 
-    노드를 타입으로 분류하지 않고 degree와 boundary_ratio를
-    연속값으로 직접 가중치에 매핑.
+    GNN 편향은 노드의 구조적 위치에 따라 세 가지 독립적인 경로로 전파됨:
 
-      w_degree   = normalize(log(deg + 1))    log 스케일로 heavy-tail 완화
-      w_boundary = normalize(boundary_ratio)  타 그룹 이웃 비율
-      w_raw      = alpha * w_degree + (1 - alpha) * w_boundary
-      weight     = min_weight + (max_weight - min_weight) * w_raw
+      [경로 1] Propagation Influence (Dong et al., AAAI 2023):
+        허브 노드는 L-hop 전파에서 influence score가 높아
+        편향된 representation을 더 많은 이웃에 전파함.
+        → w_degree = normalize(log(1 + deg(v)))
 
-    파라미터:
-      alpha      : degree 신호 반영 비중. 0.5 = degree/boundary 동등
-      min_weight : risk가 가장 낮은 노드의 가중치
-      max_weight : risk가 가장 높은 노드의 가중치
+      [경로 2] Cross-group Information Leakage (Dai & Wang, WSDM 2021; Dong et al., WWW 2022):
+        경계 노드는 두 sensitive group 사이에서 편향 정보를 중개함.
+        → w_boundary = normalize(boundary_ratio(v))
 
-    반환: weight [N] float tensor (detached 상수)
+      [경로 3] Local Homophily Deviation (Loveland et al., SDM 2025):
+        Global homophily와 크게 다른 local homophily를 가진 노드는
+        OOD 취약성으로 인해 편향 예측에 노출됨.
+        → w_lhd = normalize(|local_h(v) - global_h|)
+
+    SBRS(v) = alpha * w_degree(v) + beta * w_boundary(v) + gamma * w_lhd(v)
+
+    반환: sbrs_n [N] float tensor in [0, 1] (detached, 정규화됨)
     """
     edge_index = data.edge_index
     sens       = data.sensitive_attr
     N          = data.x.size(0)
     device     = data.x.device
 
-    ones = torch.ones(edge_index.size(1), device=device)
+    ones     = torch.ones(edge_index.size(1), device=device)
+    src, dst = edge_index
 
-    # ── degree 계산
+    # ── degree
     deg = torch.zeros(N, device=device)
-    deg.scatter_add_(0, edge_index[0], ones)
+    deg.scatter_add_(0, src, ones)
 
-    # ── log 스케일 degree → [0, 1] 정규화
-    # log1p로 heavy-tail에서 허브 노드의 과도한 지배를 완화
+    # ── [경로 1] Propagation Influence
     log_deg  = torch.log1p(deg)
     w_degree = (log_deg - log_deg.min()) / (log_deg.max() - log_deg.min() + 1e-8)
 
-    # ── boundary ratio → [0, 1] 정규화
-    src, dst       = edge_index
+    # ── [경로 2] Cross-group Leakage
     cross_edge     = (sens[src] != sens[dst]).float()
     cross_count    = torch.zeros(N, device=device)
     cross_count.scatter_add_(0, src, cross_edge)
@@ -647,9 +647,129 @@ def compute_node_risk_weights(
     w_boundary     = (boundary_ratio - boundary_ratio.min()) / \
                      (boundary_ratio.max() - boundary_ratio.min() + 1e-8)
 
-    # ── 선형 결합 후 [min_weight, max_weight]로 스케일
-    w_raw  = alpha * w_degree + (1.0 - alpha) * w_boundary
-    weight = min_weight + (max_weight - min_weight) * w_raw
+    # ── [경로 3] Local Homophily Deviation
+    same_edge   = (sens[src] == sens[dst]).float()
+    same_count  = torch.zeros(N, device=device)
+    same_count.scatter_add_(0, src, same_edge)
+    local_h     = same_count / (deg + 1e-8)
+    global_h    = local_h.mean()
+    lhd         = torch.abs(local_h - global_h)
+    w_lhd       = (lhd - lhd.min()) / (lhd.max() - lhd.min() + 1e-8)
+
+    # ── SBRS 정규화
+    sbrs   = alpha * w_degree + beta * w_boundary + gamma * w_lhd
+    sbrs_n = (sbrs - sbrs.min()) / (sbrs.max() - sbrs.min() + 1e-8)
+
+    return sbrs_n.detach()
+
+
+# =========================================================
+# Structural Uncertainty Estimation
+# =========================================================
+@torch.no_grad()
+def estimate_structural_uncertainty(model, data, T=10, drop_rate=0.1,
+                                    task_type="classification"):
+    """
+    Edge perturbation을 T회 반복하여 각 노드의 예측 확률 분산을
+    structural uncertainty로 추정.
+
+    "구조가 조금 흔들려도 예측이 크게 변하는가"를 측정.
+    warm-up 학습 후 1회 호출하여 캐시.
+
+    반환: w_unc [N] float tensor in [0, 1] (정규화됨, detached)
+    """
+    model.eval()
+    prob_list = []
+
+    for _ in range(T):
+        edge_index = data.edge_index
+        num_edges  = edge_index.size(1)
+        keep_mask  = torch.rand(num_edges, device=edge_index.device) > drop_rate
+        if keep_mask.sum() == 0:
+            keep_mask[0] = True
+        edge_pert = edge_index[:, keep_mask]
+
+        out = model(data, edge_index=edge_pert)
+        if isinstance(out, tuple):
+            out = out[0]
+        out = out.view(-1)
+
+        if task_type == "classification":
+            prob = torch.sigmoid(out)
+        else:
+            prob = out   # 회귀: 예측값 자체의 분산
+
+        prob_list.append(prob)
+
+    prob_stack  = torch.stack(prob_list, dim=0)   # [T, N]
+    uncertainty = prob_stack.var(dim=0)            # [N]
+
+    # [0, 1] 정규화
+    w_unc = (uncertainty - uncertainty.min()) / \
+            (uncertainty.max() - uncertainty.min() + 1e-8)
+
+    return w_unc.detach()
+
+
+# =========================================================
+# 2단계 게이팅 기반 최종 노드 가중치 계산
+# =========================================================
+def compute_node_risk_weights(
+    data,
+    model=None,
+    alpha=0.34,
+    beta=0.33,
+    gamma=0.33,
+    sbrs_threshold=0.5,   # 1단계 게이팅 임계값 (SBRS 정규화 기준)
+    lam=1.0,              # 2단계 uncertainty 반영 강도
+    min_weight=0.5,
+    max_weight=2.0,
+    T=10,
+    drop_rate=0.1,
+    task_type="classification",
+):
+    """
+    2단계 게이팅 기반 FIPS(Fairness Intervention Priority Score) 노드 가중치.
+
+    1단계 — 구조적 위험 노드 식별 (SBRS 기반):
+      SBRS(v) ≥ sbrs_threshold 인 노드만 fairness 개입 대상으로 선정.
+      구조적 조건이 없는 노드는 uncertainty가 높아도 개입 불필요.
+
+    2단계 — 불확실성으로 최종 가중치 조정:
+      개입 대상 노드: weight(v) = scale(SBRS(v) × (1 + λ·w_unc(v)))
+      비대상 노드:    weight(v) = min_weight
+
+    model=None이면 SBRS만 사용 (Phase 1 warm-up 중).
+    model이 주어지면 uncertainty를 추가 반영 (Phase 2 진입 시).
+
+    반환: weight [N] float tensor (detached)
+    """
+    N      = data.x.size(0)
+    device = data.x.device
+
+    # ── 1단계: SBRS 계산
+    sbrs_n = compute_sbrs(data, alpha=alpha, beta=beta, gamma=gamma)
+
+    # ── model 없으면 SBRS만으로 가중치 반환 (warm-up용)
+    if model is None:
+        weight = min_weight + (max_weight - min_weight) * sbrs_n
+        return weight.detach()
+
+    # ── 2단계: structural uncertainty 추정
+    w_unc = estimate_structural_uncertainty(
+        model, data, T=T, drop_rate=drop_rate, task_type=task_type
+    )
+
+    # ── 게이팅 적용
+    weight    = torch.full((N,), min_weight, device=device)
+    gate_mask = sbrs_n >= sbrs_threshold   # 1단계 통과 노드
+
+    if gate_mask.sum() > 0:
+        # SBRS × (1 + λ·uncertainty) → 정규화 → 스케일
+        combined   = sbrs_n[gate_mask] * (1.0 + lam * w_unc[gate_mask])
+        combined_n = (combined - combined.min()) / \
+                     (combined.max() - combined.min() + 1e-8)
+        weight[gate_mask] = min_weight + (max_weight - min_weight) * combined_n
 
     return weight.detach()
 
@@ -756,57 +876,120 @@ def weighted_regression_fairness_loss(preds, labels, sensitive_attr, weight, idx
 
 
 # =========================================================
-# NodeAwareBase: 노드 유형 인식 공통 베이스
+# NodeAwareBase: FIPS 기반 2단계 게이팅 베이스 클래스
 # =========================================================
 class NodeAwareBase(BaseMultiLevelFairGNN):
     """
     BaseMultiLevelFairGNN을 상속하여
-    연속 노드 가중치 기반 차등 fairness 개입을 추가한 베이스 클래스.
+    FIPS(Fairness Intervention Priority Score) 기반
+    2단계 게이팅 차등 fairness 개입을 추가한 베이스 클래스.
 
-    변경된 부분:
-      - compute_node_risk_weights()로 학습 전 연속 가중치 1회 계산
-      - compute_structure_loss: weighted MSE
+    설계 원칙:
+      Phase 1 (warm-up): SBRS만으로 균일하게 학습하여 모델 안정화
+      Phase 2 (main):    SBRS × structural uncertainty 2단계 게이팅으로
+                         fairness-critical 노드에 집중 개입
+
+    2단계 게이팅:
+      1단계 — SBRS ≥ threshold: 구조적 위험 노드만 개입 대상 선정
+      2단계 — SBRS × (1 + λ·uncertainty): 실제 불안정한 노드 우선
+
+    변경된 부분 (BaseMultiLevelFairGNN 대비):
+      - fit(): warm-up → uncertainty 추정 → 가중치 갱신 → 본 학습
+      - compute_structure_loss: FIPS weighted MSE
       - compute_representation_loss: WeightedGroupWiseNorm
-      - compute_output_loss: subclass에서 weighted loss 사용
+      - compute_output_loss: subclass에서 FIPS weighted loss 사용
     """
     def __init__(
         self,
         task_type,
         device,
-        alpha=0.5,        # degree 신호 vs boundary 신호 비중
-        min_weight=0.5,   # 최소 가중치
-        max_weight=2.0,   # 최대 가중치
+        # SBRS 하이퍼파라미터
+        alpha=0.34,           # 경로 1: Propagation Influence 비중
+        beta=0.33,            # 경로 2: Cross-group Leakage 비중
+        gamma=0.33,           # 경로 3: Local Homophily Deviation 비중
+        # 2단계 게이팅 하이퍼파라미터
+        sbrs_threshold=0.5,   # 1단계 임계값 (SBRS 정규화 기준, 0.5=상위50%)
+        lam=1.0,              # 2단계 uncertainty 반영 강도
+        # 가중치 범위
+        min_weight=0.5,
+        max_weight=2.0,
+        # uncertainty 추정 설정
+        warm_up=100,          # uncertainty 추정 전 선행 학습 epoch
+        unc_T=10,             # perturbation 반복 횟수
+        unc_drop=0.1,         # edge dropout 비율
     ):
         super().__init__(task_type=task_type, device=device)
 
-        # 연속 가중치 하이퍼파라미터
-        self.alpha      = alpha
-        self.min_weight = min_weight
-        self.max_weight = max_weight
+        # SBRS
+        self.alpha          = alpha
+        self.beta           = beta
+        self.gamma          = gamma
+        # 게이팅
+        self.sbrs_threshold = sbrs_threshold
+        self.lam            = lam
+        # 가중치 범위
+        self.min_weight     = min_weight
+        self.max_weight     = max_weight
+        # warm-up / uncertainty
+        self.warm_up        = warm_up
+        self.unc_T          = unc_T
+        self.unc_drop       = unc_drop
 
-        # weighted group norm (기존 GroupWiseNorm 대체)
-        self.group_norm = WeightedGroupWiseNorm()
+        # weighted group norm
+        self.group_norm     = WeightedGroupWiseNorm()
 
-        # 노드 가중치 캐시 (fit() 호출 시 초기화)
+        # 노드 가중치 캐시
         self._node_weight: torch.Tensor | None = None
 
-    def _build_node_weights(self, data):
+    # ── Phase 1: SBRS만으로 초기 가중치 설정 (warm-up용)
+    def _init_node_weights_sbrs(self, data):
         self._node_weight = compute_node_risk_weights(
             data,
+            model      = None,   # uncertainty 없이 SBRS만
             alpha      = self.alpha,
+            beta       = self.beta,
+            gamma      = self.gamma,
             min_weight = self.min_weight,
             max_weight = self.max_weight,
         )
-
-        # 가중치 분포 로그
         w = self._node_weight
         print(
-            f"[{self.name}] NodeWeight | "
+            f"[{self.name}] Phase 1 NodeWeight (SBRS only) | "
             f"min={w.min():.3f} max={w.max():.3f} "
             f"mean={w.mean():.3f} std={w.std():.3f}"
         )
 
-    # ── Structure loss override
+    # ── Phase 2: SBRS × uncertainty 2단계 게이팅으로 가중치 갱신
+    def _update_node_weights_fips(self, data):
+        N      = data.x.size(0)
+        device = data.x.device
+
+        self._node_weight = compute_node_risk_weights(
+            data,
+            model           = self.model,
+            alpha           = self.alpha,
+            beta            = self.beta,
+            gamma           = self.gamma,
+            sbrs_threshold  = self.sbrs_threshold,
+            lam             = self.lam,
+            min_weight      = self.min_weight,
+            max_weight      = self.max_weight,
+            T               = self.unc_T,
+            drop_rate       = self.unc_drop,
+            task_type       = self.task_type,
+        )
+
+        w         = self._node_weight
+        gate_mask = w > self.min_weight
+        print(
+            f"[{self.name}] Phase 2 NodeWeight (FIPS) | "
+            f"gated={gate_mask.sum().item()}/{N} "
+            f"({100*gate_mask.float().mean().item():.1f}%) | "
+            f"min={w.min():.3f} max={w.max():.3f} "
+            f"mean={w.mean():.3f} std={w.std():.3f}"
+        )
+
+    # ── Structure loss override (FIPS weighted MSE)
     def compute_structure_loss(self, data, h_orig):
         idx_fair  = self._get_fair_idx(data)
         edge_pert = self.perturb_edge_index(
@@ -815,14 +998,13 @@ class NodeAwareBase(BaseMultiLevelFairGNN):
         )
         _, h_pert = self.model(data, edge_index=edge_pert, return_hidden=True)
 
-        dim  = h_orig.size(-1)
-        w    = self._node_weight[idx_fair]
-        w    = w / (w.mean() + 1e-8)
-
+        dim      = h_orig.size(-1)
+        w        = self._node_weight[idx_fair]
+        w        = w / (w.mean() + 1e-8)
         node_mse = ((h_orig[idx_fair] - h_pert[idx_fair]) ** 2).mean(dim=-1)
         return (node_mse * w).mean() / dim
 
-    # ── Representation loss override
+    # ── Representation loss override (WeightedGroupWiseNorm)
     def compute_representation_loss(self, h, sensitive_attr, idx_fair):
         return self.group_norm(
             h, sensitive_attr,
@@ -830,30 +1012,92 @@ class NodeAwareBase(BaseMultiLevelFairGNN):
             idx=idx_fair,
         )
 
-    # ── fit() override: 노드 가중치 계산 추가
+    # ── fit() override: 2단계 학습 구조
     def fit(
         self,
         data,
         epochs=1000,
         lr=1e-3,
         weight_decay=0.0,
-        patience=50,
+        patience=100,
         verbose=True,
         print_interval=50,
     ):
-        # 학습 전 노드 가중치 1회 계산
-        self._build_node_weights(data)
+        optimizer = self._build_optimizer(lr=lr, weight_decay=weight_decay)
+        criterion = self._build_criterion()
 
-        # 이후는 부모 fit() 그대로
-        super().fit(
-            data=data,
-            epochs=epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            patience=patience,
-            verbose=verbose,
-            print_interval=print_interval,
-        )
+        # ── Phase 1: warm-up (SBRS만으로 학습)
+        self._init_node_weights_sbrs(data)
+
+        if verbose:
+            print(f"[{self.name}] Phase 1: warm-up {self.warm_up} epochs...")
+
+        for epoch in range(self.warm_up):
+            self.train_step(data, optimizer, criterion)
+
+        # ── uncertainty 추정 및 FIPS 가중치 갱신
+        if verbose:
+            print(
+                f"[{self.name}] Estimating structural uncertainty "
+                f"(T={self.unc_T}, drop={self.unc_drop})..."
+            )
+        self._update_node_weights_fips(data)
+        self.model.train()
+
+        # ── Phase 2: 본 학습 (FIPS 가중치 적용)
+        best_val_score = -float("inf")
+        best_state     = copy.deepcopy(self.model.state_dict())
+        counter        = 0
+        remaining      = epochs - self.warm_up
+
+        if verbose:
+            print(f"[{self.name}] Phase 2: main training {remaining} epochs...")
+
+        for epoch in range(remaining):
+            train_info = self.train_step(data, optimizer, criterion)
+            val_result = evaluate_pyg_model(
+                self.model, data, split="val", task_type=self.task_type
+            )
+            val_score = self._compute_val_score(val_result)
+
+            if val_score > best_val_score:
+                best_val_score = val_score
+                best_state     = copy.deepcopy(self.model.state_dict())
+                counter        = 0
+            else:
+                counter += 1
+
+            if verbose and (epoch == 0 or (epoch + 1) % print_interval == 0):
+                train_result = evaluate_pyg_model(
+                    self.model, data, split="train", task_type=self.task_type
+                )
+                print(
+                    f"[{self.name}] "
+                    f"Epoch {epoch + self.warm_up + 1:04d} | "
+                    f"Total {train_info['total_loss']:.4f} | "
+                    f"Task {train_info['task_loss']:.4f} | "
+                    f"Struct {train_info['struct_loss']:.4f} | "
+                    f"Rep {train_info['rep_loss']:.4f} | "
+                    f"Out {train_info['out_loss']:.4f} | "
+                    f"Train {train_result} | "
+                    f"Val {val_result} | "
+                    f"ValScore {val_score:.4f}"
+                )
+
+            if counter >= patience:
+                if verbose:
+                    print(
+                        f"[{self.name}] Early stopping at epoch "
+                        f"{epoch + self.warm_up + 1}."
+                    )
+                break
+
+        self.model.load_state_dict(best_state)
+        if verbose:
+            print(
+                f"[{self.name}] Training finished. "
+                f"Best val score: {best_val_score:.4f}"
+            )
 
 
 # =========================================================
@@ -877,17 +1121,34 @@ class NAFnCGNN(NodeAwareBase):
         ablate_out=False,
         val_tradeoff_dp=0.3,
         val_tradeoff_eo=0.3,
-        # 연속 노드 가중치 하이퍼파라미터
-        alpha=0.5,
+        # SBRS 하이퍼파라미터
+        alpha=0.34,           # 경로 1: Propagation Influence (degree) 비중
+        beta=0.33,            # 경로 2: Cross-group Leakage (boundary ratio) 비중
+        gamma=0.33,           # 경로 3: Local Homophily Deviation 비중
+        # 2단계 게이팅 하이퍼파라미터
+        sbrs_threshold=0.5,   # 1단계 임계값
+        lam=1.0,              # uncertainty 반영 강도
+        # 가중치 범위
         min_weight=0.5,
         max_weight=2.0,
+        # warm-up / uncertainty 설정
+        warm_up=100,
+        unc_T=10,
+        unc_drop=0.1,
     ):
         super().__init__(
-            task_type  = "classification",
-            device     = device,
-            alpha      = alpha,
-            min_weight = min_weight,
-            max_weight = max_weight,
+            task_type       = "classification",
+            device          = device,
+            alpha           = alpha,
+            beta            = beta,
+            gamma           = gamma,
+            sbrs_threshold  = sbrs_threshold,
+            lam             = lam,
+            min_weight      = min_weight,
+            max_weight      = max_weight,
+            warm_up         = warm_up,
+            unc_T           = unc_T,
+            unc_drop        = unc_drop,
         )
 
         assert name in ["GCN", "GraphSAGE", "SGC"], "지원하지 않는 모델입니다."
@@ -956,17 +1217,34 @@ class NAFnRGNN(NodeAwareBase):
         val_tradeoff_mae=1.0,
         val_tradeoff_bias=1.0,
         val_tradeoff_mean_pred=0.5,
-        # 연속 노드 가중치 하이퍼파라미터
-        alpha=0.5,
+        # SBRS 하이퍼파라미터
+        alpha=0.34,           # 경로 1: Propagation Influence (degree) 비중
+        beta=0.33,            # 경로 2: Cross-group Leakage (boundary ratio) 비중
+        gamma=0.33,           # 경로 3: Local Homophily Deviation 비중
+        # 2단계 게이팅 하이퍼파라미터
+        sbrs_threshold=0.5,
+        lam=1.0,
+        # 가중치 범위
         min_weight=0.5,
         max_weight=2.0,
+        # warm-up / uncertainty 설정
+        warm_up=100,
+        unc_T=10,
+        unc_drop=0.1,
     ):
         super().__init__(
-            task_type  = "regression",
-            device     = device,
-            alpha      = alpha,
-            min_weight = min_weight,
-            max_weight = max_weight,
+            task_type       = "regression",
+            device          = device,
+            alpha           = alpha,
+            beta            = beta,
+            gamma           = gamma,
+            sbrs_threshold  = sbrs_threshold,
+            lam             = lam,
+            min_weight      = min_weight,
+            max_weight      = max_weight,
+            warm_up         = warm_up,
+            unc_T           = unc_T,
+            unc_drop        = unc_drop,
         )
 
         assert name in ["GCN", "GraphSAGE", "SGC"], "지원하지 않는 모델입니다."

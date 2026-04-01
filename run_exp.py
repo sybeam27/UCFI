@@ -326,10 +326,19 @@ def run_classification_experiment(
         drop_edge_rate_struct=0.1,
         val_tradeoff_dp=0.3,
         val_tradeoff_eo=0.3,
-        # 연속 노드 가중치 파라미터
-        alpha=0.5,       # degree : boundary = 5 : 5
-        min_weight=0.5,  # risk 최저 노드 가중치
-        max_weight=2.0,  # risk 최고 노드 가중치
+        # SBRS 파라미터
+        alpha=0.34,
+        beta=0.33,
+        gamma=0.33,
+        # 2단계 게이팅 파라미터
+        sbrs_threshold=0.5,   # SBRS 상위 50% 노드만 개입 대상
+        lam=1.0,              # uncertainty 반영 강도
+        min_weight=0.5,
+        max_weight=2.0,
+        # warm-up / uncertainty 설정
+        warm_up=100,          # uncertainty 추정 전 선행 학습 epoch
+        unc_T=10,             # perturbation 반복 횟수
+        unc_drop=0.1,         # edge dropout 비율
     )
     na_fnc.fit(
         data,
@@ -461,10 +470,21 @@ def run_regression_experiment(
         val_tradeoff_bias=1.0,
         val_tradeoff_mean_pred=0.5,
 
-        # 연속 노드 가중치 파라미터
-        alpha=0.5,       # degree : boundary = 5 : 5
-        min_weight=0.5,  # risk 최저 노드 가중치
-        max_weight=2.0,  # risk 최고 노드 가중치
+        # SBRS 파라미터
+        alpha=0.34,
+        beta=0.33,
+        gamma=0.33,
+
+        # 2단계 게이팅 파라미터
+        sbrs_threshold=0.5,
+        lam=1.0,
+        min_weight=0.5,
+        max_weight=2.0,
+        
+        # warm-up / uncertainty 설정
+        warm_up=100,
+        unc_T=10,
+        unc_drop=0.1,
     )
     na_fnr.fit(
         data,
@@ -622,8 +642,7 @@ if __name__ == "__main__":
 
     # 저장: raw + summary 둘 다
     base_name = f"outputs/{args.dataset_name}_{args.task_type}_{args.sens_attr}_runs{args.runs}"
-    # raw_df.to_csv(f"{base_name}_raw.csv", index=False)
-    # print(f"\nSaved: {base_name}_raw.csv")
-
+    raw_df.to_csv(f"{base_name}_raw.csv", index=False)
     summary_df.to_csv(f"{base_name}_summary.csv", index=False)
+    print(f"\nSaved: {base_name}_raw.csv")
     print(f"Saved: {base_name}_summary.csv")
