@@ -331,7 +331,7 @@ def run_classification_experiment(
         beta=0.33,
         gamma=0.33,
         # 2단계 게이팅 파라미터
-        sbrs_threshold=0.5,   # SBRS 상위 50% 노드만 개입 대상
+        sbrs_threshold=0.3,   # SBRS 상위 50% 노드만 개입 대상
         lam=1.0,              # uncertainty 반영 강도
         min_weight=0.5,
         max_weight=2.0,

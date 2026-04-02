@@ -4,6 +4,7 @@ python run_exp.py \
     --dataset_name pokec_z \
     --sens_attr region \
     --remove_leakage \
+    --baseline \
     --backbone GraphSAGE \
     --hidden_dim 256 \
     --dropout 0.5 \
