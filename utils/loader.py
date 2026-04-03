@@ -1,16 +1,13 @@
-from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple, Set
+import torch
 import random
-
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-import torch
+
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Tuple, Set
 
 
-# =========================================================
-# Dataset configs
-# =========================================================
 CLASSIFICATION_DATASET_CONFIGS = {
     "pokec_z": {
         "csv_file": "region_job.csv",
@@ -72,7 +69,6 @@ CLASSIFICATION_DATASET_CONFIGS = {
         "dn": "NBA_SalaryBinary_Classification",
     },
 }
-
 
 REGRESSION_DATASET_CONFIGS = {
     "pokec_z": {
@@ -139,15 +135,13 @@ REGRESSION_DATASET_CONFIGS = {
     },
 }
 
-
-# =========================================================
-# Config helpers
-# =========================================================
 def _get_dataset_config(dataset_name: str, task_type: str) -> Dict[str, Any]:
     if task_type == "classification":
         configs = CLASSIFICATION_DATASET_CONFIGS
+    
     elif task_type == "regression":
         configs = REGRESSION_DATASET_CONFIGS
+    
     else:
         raise ValueError(f"task_type must be 'classification' or 'regression', got {task_type}")
 
@@ -157,11 +151,10 @@ def _get_dataset_config(dataset_name: str, task_type: str) -> Dict[str, Any]:
     return configs[dataset_name]
 
 
-# =========================================================
-# Graph utils
-# =========================================================
+
 def _build_symmetric_adj(num_nodes: int, edges: np.ndarray) -> sp.coo_matrix:
     edges = np.asarray(edges, dtype=np.int64)
+    
     if edges.ndim != 2 or edges.shape[1] != 2:
         raise ValueError(f"edges shape must be (E, 2), got {edges.shape}")
 
@@ -183,6 +176,7 @@ def _build_symmetric_adj(num_nodes: int, edges: np.ndarray) -> sp.coo_matrix:
     )
     adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
     adj = adj + sp.eye(adj.shape[0], dtype=np.float32)
+    
     return adj.tocoo()
 
 def _load_edges(
@@ -231,9 +225,7 @@ def _load_edges(
     return edges
 
 
-# =========================================================
-# Leakage rules
-# =========================================================
+
 def _get_pokec_completion_leakage_cols(df_columns: List[str]) -> Set[str]:
     """
     completion_percentage를 target으로 쓸 때,
@@ -384,18 +376,18 @@ def _get_dataset_leakage_drop_cols(
     return sorted(drop)
 
 
-# =========================================================
-# Feature utils
-# =========================================================
+
 def _onehot_features(df: pd.DataFrame, drop_cols: List[str]) -> pd.DataFrame:
     feature_cols = [c for c in df.columns if c not in set(drop_cols)]
     feature_df = df[feature_cols].copy()
     feature_df = pd.get_dummies(feature_df, drop_first=False)
+    
     return feature_df
 
 def _encode_numeric_or_categorical(series: pd.Series) -> np.ndarray:
     if pd.api.types.is_numeric_dtype(series):
         return series.to_numpy()
+    
     return pd.Categorical(series).codes.astype(np.int64)
 
 def _encode_sensitive_attribute(series: pd.Series, dataset_type: str) -> np.ndarray:
@@ -435,19 +427,17 @@ def _encode_classification_labels(
     y[y > 1] = 1
     return y
 
-
 def _encode_regression_labels(series: pd.Series) -> np.ndarray:
     if not pd.api.types.is_numeric_dtype(series):
         raise ValueError(
             f"Regression target '{series.name}' must be numeric, "
             f"but got dtype={series.dtype}"
         )
+    
     return series.to_numpy(dtype=np.float32)
 
 
-# =========================================================
-# Split utils
-# =========================================================
+
 def _pokec_style_split(
     labels: np.ndarray,
     sens: np.ndarray,
@@ -502,10 +492,12 @@ def _german_style_balanced_split(
         label_idx_0[:min(int(0.5 * len(label_idx_0)), label_number // 2)],
         label_idx_1[:min(int(0.5 * len(label_idx_1)), label_number // 2)],
     )
+
     idx_val = np.append(
         label_idx_0[int(0.5 * len(label_idx_0)):int(0.75 * len(label_idx_0))],
         label_idx_1[int(0.5 * len(label_idx_1)):int(0.75 * len(label_idx_1))],
     )
+
     idx_test = np.append(
         label_idx_0[int(0.75 * len(label_idx_0)):],
         label_idx_1[int(0.75 * len(label_idx_1)):],
@@ -557,9 +549,7 @@ def _regression_random_split(
     )
 
 
-# =========================================================
-# Main loader
-# =========================================================
+
 def load_fairness_dataset(
     dataset_name: str,
     root: str,
@@ -596,6 +586,7 @@ def load_fairness_dataset(
 
     if sens_attr is None:
         sens_attr = cfg["sens_attrs"][0]
+
     if sens_attr not in cfg["sens_attrs"]:
         raise ValueError(
             f"sens_attr '{sens_attr}' is not allowed for {dataset_name}/{task_type}. "
@@ -734,7 +725,6 @@ def load_fairness_dataset(
         "auto_leakage_cols": auto_leakage_cols,
     }
 
-
 def get_dataset_root(dataset_name: str) -> str:
     if dataset_name in ["pokec_z", "pokec_n"]:
         return "./data/pokec"
@@ -745,7 +735,6 @@ def get_dataset_root(dataset_name: str) -> str:
     else:
         raise ValueError(f"Unsupported dataset_name: {dataset_name}")
 
-
 def get_default_sens_attrs(dataset_name: str):
     if dataset_name in ["pokec_z", "pokec_n"]:
         return ["region", "gender"]
@@ -755,7 +744,6 @@ def get_default_sens_attrs(dataset_name: str):
         return ["Gender"]
     else:
         raise ValueError(f"Unsupported dataset_name: {dataset_name}")
-
 
 def load_dataset_from_args(
     dataset_name: str,
@@ -776,4 +764,45 @@ def load_dataset_from_args(
         sens_attr=sens_attr,
         remove_leakage=remove_leakage,
     )
+
     return dataset_dict
+
+def build_pyg_data_from_loader_dict(dataset_dict, device, task_type="classification"):
+    
+    adj = dataset_dict["adj"]
+    
+    if not sp.isspmatrix(adj):
+        raise TypeError("dataset_dict['adj'] must be a scipy sparse matrix.")
+
+    adj = adj.tocoo()
+    edge_index = torch.tensor(
+        [adj.row, adj.col],
+        dtype=torch.long,
+        device=device,
+    )
+
+    x = dataset_dict["features"].float().to(device)
+
+    if task_type == "classification":
+        y = dataset_dict["labels"].long().view(-1).to(device)
+    elif task_type == "regression":
+        y = dataset_dict["labels"].float().view(-1).to(device)
+    else:
+        raise ValueError("task_type must be 'classification' or 'regression'.")
+
+    sensitive_attr = dataset_dict["sens"].long().view(-1).to(device)
+
+    data = Data(
+        x=x,
+        edge_index=edge_index,
+        y=y,
+        sensitive_attr=sensitive_attr,
+    )
+    data.idx_train = dataset_dict["idx_train"].long().to(device)
+    data.idx_val = dataset_dict["idx_val"].long().to(device)
+    data.idx_test = dataset_dict["idx_test"].long().to(device)
+
+    if "idx_sens_train" in dataset_dict:
+        data.idx_sens_train = dataset_dict["idx_sens_train"].long().to(device)
+
+    return data

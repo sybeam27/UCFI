@@ -1,20 +1,20 @@
-import argparse
 import copy
+import torch
 import random
+import argparse
+
 import numpy as np
 import pandas as pd
-import torch
 import torch.nn as nn
 
+from utils.metrics import evaluate_pyg_model
+from utils.loader import load_dataset_from_args, build_pyg_data_from_loader_dict
 from model import (
     build_pyg_data_from_loader_dict,
     build_backbone,
     FnCGNN, NAFnCGNN,
     FnRGNN, NAFnRGNN,
 )
-
-from utils.metrics import evaluate_pyg_model
-from utils.loader import load_dataset_from_args
 
 
 # =========================================================

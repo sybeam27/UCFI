@@ -6,54 +6,9 @@ import torch.nn.functional as F
 
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv, SAGEConv, SGConv
-
-from utils.metrics import (
-    classification_metrics,
-    classification_fairness_metrics,
-    regression_metrics,
-    regression_fairness_metrics,
-    evaluate_pyg_model,
-)
+from utils.metrics import evaluate_pyg_model
 
 
-# Loader output -> PyG Data
-def build_pyg_data_from_loader_dict(dataset_dict, device, task_type="classification"):
-    adj = dataset_dict["adj"]
-    if not sp.isspmatrix(adj):
-        raise TypeError("dataset_dict['adj'] must be a scipy sparse matrix.")
-
-    adj = adj.tocoo()
-    edge_index = torch.tensor(
-        [adj.row, adj.col],
-        dtype=torch.long,
-        device=device,
-    )
-
-    x = dataset_dict["features"].float().to(device)
-
-    if task_type == "classification":
-        y = dataset_dict["labels"].long().view(-1).to(device)
-    elif task_type == "regression":
-        y = dataset_dict["labels"].float().view(-1).to(device)
-    else:
-        raise ValueError("task_type must be 'classification' or 'regression'.")
-
-    sensitive_attr = dataset_dict["sens"].long().view(-1).to(device)
-
-    data = Data(
-        x=x,
-        edge_index=edge_index,
-        y=y,
-        sensitive_attr=sensitive_attr,
-    )
-    data.idx_train = dataset_dict["idx_train"].long().to(device)
-    data.idx_val = dataset_dict["idx_val"].long().to(device)
-    data.idx_test = dataset_dict["idx_test"].long().to(device)
-
-    if "idx_sens_train" in dataset_dict:
-        data.idx_sens_train = dataset_dict["idx_sens_train"].long().to(device)
-
-    return data
 
 
 # =========================================================
