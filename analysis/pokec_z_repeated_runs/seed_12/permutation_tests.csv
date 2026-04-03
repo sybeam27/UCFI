@@ -1,0 +1,13 @@
+subset,metric,subset_n,observed,p_value,seed
+high_boundary,parity,531,0.023363550573365033,0.9195,12
+high_boundary,equality,531,0.07224523612261813,0.424,12
+high_influence,parity,514,0.028559301479505195,0.8945,12
+high_influence,equality,514,0.013042111879321139,0.9035,12
+high_sged,parity,531,0.023363550573365033,0.9195,12
+high_sged,equality,531,0.07224523612261813,0.424,12
+minority_high_boundary,,242,,,12
+minority_high_boundary,,242,,,12
+minority_high_influence,,266,,,12
+minority_high_influence,,266,,,12
+high_boundary_and_high_influence,parity,309,0.023295981127306464,0.866,12
+high_boundary_and_high_influence,equality,309,0.05884425651867509,0.574,12

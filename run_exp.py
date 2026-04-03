@@ -1,52 +1,82 @@
-import copy
+import os
 import torch
 import random
 import argparse
 
 import numpy as np
 import pandas as pd
-import torch.nn as nn
 
-from utils.metrics import evaluate_pyg_model
-from utils.loader import load_dataset_from_args, build_pyg_data_from_loader_dict
-from model import (
-    build_pyg_data_from_loader_dict,
-    build_backbone,
-    FnCGNN, NAFnCGNN,
-    FnRGNN, NAFnRGNN,
+from utils.model import (
+    BaselineGNN,
+    FnCGNN, SUMMIT_C,
+    FnRGNN, SUMMIT_R,
 )
 
+from utils.loader import load_dataset_from_args, build_pyg_data_from_loader_dict
 
-# =========================================================
-# Reproducibility
-# =========================================================
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-# unlabeled 확인!
+def save_summary(summary: pd.DataFrame, args: argparse.Namespace, save_dir: str = "outputs"):
+    """
+    summary를 CSV로 저장. 동일 파일이 있으면 행을 추가하되,
+    완전히 동일한 조건(모든 컬럼 값이 같은 행)은 덮어씀.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"{args.task_type}_{args.dataset_name}.csv")
+
+    # 실험 조건 컬럼 추가
+    summary["dataset"]    = args.dataset_name
+    summary["sens_attr"]  = args.sens_attr
+    summary["runs"]       = args.runs
+    summary["epochs"]     = args.epochs
+    summary["lr"]         = args.lr
+    summary["lambda_fair"] = args.lambda_fair
+    summary["warm_up"]    = args.warm_up
+
+    if args.model == "NaFn":
+        summary["sbrs_threshold"]    = args.sbrs_threshold
+        summary["lam"]               = args.lam
+        summary["ablate_sbrs"]       = args.ablate_sbrs
+        summary["ablate_uncertainty"] = args.ablate_uncertainty
+
+    # 조건 식별 키
+    key_cols = ["dataset", "sens_attr", "task", "model", "backbone",
+                "runs", "epochs", "lr", "lambda_fair", "warm_up"]
+
+    if os.path.exists(save_path):
+        existing = pd.read_csv(save_path)
+
+        # 동일 조건 행 제거 후 새 결과 추가
+        merge_keys = [c for c in key_cols if c in existing.columns and c in summary.columns]
+        merged = existing.merge(summary[merge_keys], on=merge_keys, how="left", indicator=True)
+        existing = existing[merged["_merge"] == "left_only"].drop(columns=["_merge"], errors="ignore")
+
+        final = pd.concat([existing, summary], ignore_index=True)
+    else:
+        final = summary
+
+    # ── 저장 직전 수치 컬럼 소수점 4자리 반올림
+    numeric_cols = final.select_dtypes(include="number").columns
+    final[numeric_cols] = final[numeric_cols].round(4)
+
+    final.to_csv(save_path, index=False)
+    print(f"[Save] {save_path} ({len(final)} rows)")
+
+
+
 def prepare_classification_dataset(dataset_dict, train_per_class=500, seed=42):
-    """
-    FairGNN/NIFTY 등 주요 fairness GNN 논문의 pokec 처리 방식을 따름.
-
-    1. label binarize: label > 1  →  1, label == 0 → 0, label == -1 → 제거
-    2. split 재구성:
-       - train: 각 클래스별 min(train_per_class, 50%) 개
-       - val:   labeled 나머지의 50%
-       - test:  labeled 나머지의 50%
-    """
     labels = dataset_dict["labels"].clone()
-
-    # Step 1: binarize  (>1 → 1, -1 → 제거)
     labels[labels > 1] = 1
     dataset_dict["labels"] = labels
 
-    valid_mask = labels >= 0  # -1 제거용 마스크
+    valid_mask  = labels >= 0
     labeled_idx = torch.where(valid_mask)[0]
 
-    # Step 2: class별로 분리
     idx_0 = labeled_idx[labels[labeled_idx] == 0]
     idx_1 = labeled_idx[labels[labeled_idx] == 1]
 
@@ -59,7 +89,6 @@ def prepare_classification_dataset(dataset_dict, train_per_class=500, seed=42):
     idx_0 = shuffle(idx_0)
     idx_1 = shuffle(idx_1)
 
-    # Step 3: train — 각 클래스별 min(train_per_class, 50%)
     n_train_0 = min(train_per_class, int(len(idx_0) * 0.5))
     n_train_1 = min(train_per_class, int(len(idx_1) * 0.5))
 
@@ -68,7 +97,6 @@ def prepare_classification_dataset(dataset_dict, train_per_class=500, seed=42):
 
     idx_train = torch.cat([train_0, train_1])
 
-    # Step 4: val/test — 나머지를 50/50
     rest = shuffle(torch.cat([rest_0, rest_1]))
     mid  = len(rest) // 2
     idx_val  = rest[:mid]
@@ -77,459 +105,213 @@ def prepare_classification_dataset(dataset_dict, train_per_class=500, seed=42):
     dataset_dict["idx_train"]      = idx_train
     dataset_dict["idx_val"]        = idx_val
     dataset_dict["idx_test"]       = idx_test
-    dataset_dict["idx_sens_train"] = idx_train  # sens_train도 train과 동일하게
+    dataset_dict["idx_sens_train"] = idx_train
 
-    print(f"[prepare] binarize 완료 | "
-          f"class 0: {len(idx_0)}개, class 1: {len(idx_1)}개")
-    print(f"[prepare] train={len(idx_train)} "
-          f"(0:{n_train_0}, 1:{n_train_1}) | "
+    print(f"[prepare] binarize 완료 | class 0: {len(idx_0)}개, class 1: {len(idx_1)}개")
+    print(f"[prepare] train={len(idx_train)} (0:{n_train_0}, 1:{n_train_1}) | "
           f"val={len(idx_val)} | test={len(idx_test)}")
 
     return dataset_dict
 
-# =========================================================
-# Baseline Wrapper
-# =========================================================
-class BaselineGNN:
-    def __init__(
-        self,
-        in_feats,
-        h_feats,
-        device,
-        task_type="classification",
-        name="GCN",
-        dropout=0.1,
-        sgc_k=2,
-    ):
-        assert task_type in ["classification", "regression"]
-        assert name in ["GCN", "GraphSAGE", "SGC"]
-
-        self.name = f"{name}/Baseline"
-        self.backbone_name = name
-        self.task_type = task_type
-        self.device = device
-
-        self.model = build_backbone(
-            name=name,
-            in_feats=in_feats,
-            h_feats=h_feats,
-            dropout=dropout,
-            sgc_k=sgc_k,
-        ).to(device)
-
-    def _build_optimizer(self, lr, weight_decay):
-        return torch.optim.Adam(
-            self.model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
-        )
-
-    def _build_criterion(self):
-        if self.task_type == "classification":
-            return nn.BCEWithLogitsLoss()
-        return nn.MSELoss()
-
-    def _compute_val_score(self, val_result):
-        if self.task_type == "classification":
-            return float(val_result.get("acc", 0.0))
-        else:
-            return -float(val_result.get("mae", float("inf")))
-
-    def train_step(self, data, optimizer, criterion):
-        self.model.train()
-        optimizer.zero_grad()
-
-        out = self.model(data).view(-1)
-        labels = data.y.float()
-        idx_train = data.idx_train
-
-        loss = criterion(out[idx_train], labels[idx_train])
-        loss.backward()
-        optimizer.step()
-
-        return {
-            "total_loss": float(loss.item()),
-            "task_loss": float(loss.item()),
-        }
-
-    def fit(
-        self,
-        data,
-        epochs=300,
-        lr=1e-3,
-        weight_decay=0.0,
-        patience=50,
-        verbose=True,
-        print_interval=50,
-    ):
-        optimizer = self._build_optimizer(lr=lr, weight_decay=weight_decay)
-        criterion = self._build_criterion()
-
-        best_val_score = -float("inf")
-        best_state = copy.deepcopy(self.model.state_dict())
-        counter = 0
-
-        for epoch in range(epochs):
-            train_info = self.train_step(data, optimizer, criterion)
-
-            val_result = evaluate_pyg_model(
-                self.model,
-                data,
-                split="val",
-                task_type=self.task_type,
-            )
-            val_score = self._compute_val_score(val_result)
-
-            if val_score > best_val_score:
-                best_val_score = val_score
-                best_state = copy.deepcopy(self.model.state_dict())
-                counter = 0
-            else:
-                counter += 1
-
-            if verbose and (epoch == 0 or (epoch + 1) % print_interval == 0):
-                train_result = evaluate_pyg_model(
-                    self.model,
-                    data,
-                    split="train",
-                    task_type=self.task_type,
-                )
-                print(
-                    f"[{self.name}] "
-                    f"Epoch {epoch+1:04d} | "
-                    f"Loss {train_info['total_loss']:.4f} | "
-                    f"Train {train_result} | "
-                    f"Val {val_result} | "
-                    f"ValScore {val_score:.4f}"
-                )
-
-            if counter >= patience:
-                break
-
-        self.model.load_state_dict(best_state)
-
-    @torch.no_grad()
-    def evaluate(self, data, split="test"):
-        return evaluate_pyg_model(
-            self.model,
-            data,
-            split=split,
-            task_type=self.task_type,
-        )
-
-
-# =========================================================
-# Experiment runners
-# =========================================================
-def run_classification_experiment(
-    dataset_dict,
-    device="cpu",
-    backbone="GCN",
-    baseline = False,
-    hidden_dim=64,
-    dropout=0.1,
-    sgc_k=2,
-    lr=1e-3,
-    weight_decay=0.0,
-    epochs=300,
-    patience=50,
-    seed=42,
-):
-    set_seed(seed)
-
+def run_classification_experiment(dataset_dict, args):
+    set_seed(args.seed)
     data = build_pyg_data_from_loader_dict(
-        dataset_dict,
-        device=device,
-        task_type="classification",
+        dataset_dict, device=args.device, task_type="classification"
     )
-
-    results = []
 
     print("=" * 80)
-    print(f"[Classification] Backbone = {backbone}")
+    print(f"[Classification] model={args.model} | backbone={args.backbone}")
     print("=" * 80)
 
-    if baseline:
-        baseline_md = BaselineGNN(
-            in_feats=data.x.size(1),
-            h_feats=hidden_dim,
-            device=device,
-            task_type="classification",
-            name=backbone,
-            dropout=dropout,
-            sgc_k=sgc_k,
+    if args.model == "baseline":
+        md = BaselineGNN(
+            in_feats=data.x.size(1), h_feats=args.hidden_dim,
+            device=args.device, task_type="classification",
+            name=args.backbone, dropout=args.dropout, sgc_k=args.sgc_k,
         )
-        baseline_md.fit(
-            data,
-            epochs=epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            patience=patience,
-            verbose=True,
+        md.fit(data, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+               patience=args.patience, verbose=True)
+
+    elif args.model == "multi":
+        md = FnCGNN(
+            in_feats=data.x.size(1), h_feats=args.hidden_dim,
+            device=args.device, name=args.backbone,
+            dropout=args.dropout, sgc_k=args.sgc_k,
+            drop_edge_rate_struct=args.drop_edge_rate_struct,
+            lambda_fair=args.lambda_fair, warm_up=args.warm_up,
+            ablate_struct=args.ablate_struct,
+            ablate_rep=args.ablate_rep,
+            ablate_out=args.ablate_out,
+            val_tradeoff_dp=args.val_tradeoff_dp,
+            val_tradeoff_eo=args.val_tradeoff_eo,
         )
-        baseline_test = baseline_md.evaluate(data, split="test")
-        results.append({
-            "task": "classification",
-            "model": "Baseline",
-            "backbone": backbone,
-            **baseline_test,
-        })
+        md.fit(data, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+               patience=args.patience, verbose=True)
 
-    fnc = FnCGNN(
-        in_feats=data.x.size(1),
-        h_feats=hidden_dim,
-        device=device,
-        name=backbone,
-        dropout=dropout,
-        sgc_k=sgc_k,
+    elif args.model == "summit":
+        md = SUMMIT_C(
+            in_feats=data.x.size(1), h_feats=args.hidden_dim,
+            device=args.device, name=args.backbone,
+            dropout=args.dropout, sgc_k=args.sgc_k,
+            drop_edge_rate_struct=args.drop_edge_rate_struct,
+            lambda_fair=args.lambda_fair,
+            ablate_struct=args.ablate_struct,
+            ablate_rep=args.ablate_rep,
+            ablate_out=args.ablate_out,
+            val_tradeoff_dp=args.val_tradeoff_dp,
+            val_tradeoff_eo=args.val_tradeoff_eo,
+            sbrs_threshold=args.sbrs_threshold,
+            lam=args.lam,
+            min_weight=args.min_weight,
+            max_weight=args.max_weight,
+            warm_up=args.warm_up,
+            ablate_sbrs=args.ablate_sbrs,
+            ablate_uncertainty=args.ablate_uncertainty,
+        )
+        md.fit(data, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+               patience=args.patience, verbose=True)
 
-        lambda_struct=0.001,
-        lambda_rep=0.01,
-        lambda_out=0.1,
+    else:
+        raise ValueError(f"Unknown model: {args.model}")
 
-        drop_edge_rate_struct=0.1,
-
-        ablate_struct=False,
-        ablate_rep=False,
-        ablate_out=False,
-
-        val_tradeoff_dp=0.3,
-        val_tradeoff_eo=0.3,
-    )
-    fnc.fit(
-        data,
-        epochs=epochs,
-        lr=lr,
-        weight_decay=weight_decay,
-        patience=patience,
-        verbose=True,
-    )
-    fnc_test = fnc.evaluate(data, split="test")
-    results.append({
+    test_result = md.evaluate(data, split="test")
+    return pd.DataFrame([{
         "task": "classification",
-        "model": "FnCGNN",
-        "backbone": backbone,
-        **fnc_test,
-    })
+        "model": args.model,
+        "backbone": args.backbone,
+        **test_result,
+    }])
 
-    # ── NAFnCGNN 추가
-    na_fnc = NAFnCGNN(
-        in_feats=data.x.size(1),
-        h_feats=hidden_dim,
-        device=device,
-        name=backbone,
-        dropout=dropout,
-        sgc_k=sgc_k,
-        lambda_struct=0.001,
-        lambda_rep=0.01,
-        lambda_out=0.1,
-        drop_edge_rate_struct=0.1,
-        val_tradeoff_dp=0.3,
-        val_tradeoff_eo=0.3,
-        # SBRS 파라미터
-        alpha=0.34,
-        beta=0.33,
-        gamma=0.33,
-        # 2단계 게이팅 파라미터
-        sbrs_threshold=0.3,   # SBRS 상위 50% 노드만 개입 대상
-        lam=1.0,              # uncertainty 반영 강도
-        min_weight=0.5,
-        max_weight=2.0,
-        # warm-up / uncertainty 설정
-        warm_up=100,          # uncertainty 추정 전 선행 학습 epoch
-        unc_T=10,             # perturbation 반복 횟수
-        unc_drop=0.1,         # edge dropout 비율
-    )
-    na_fnc.fit(
-        data,
-        epochs=epochs,
-        lr=lr,
-        weight_decay=weight_decay,
-        patience=patience,
-        verbose=True,
-    )
-    na_fnc_test = na_fnc.evaluate(data, split="test")
-    results.append({
-        "task": "classification",
-        "model": "NAFnCGNN",
-        "backbone": backbone,
-        **na_fnc_test,
-    })
-
-    return pd.DataFrame(results)
-
-
-def run_regression_experiment(
-    dataset_dict,
-    device="cpu",
-    backbone="GCN",
-    baseline = False,
-    hidden_dim=64,
-    dropout=0.1,
-    sgc_k=2,
-    lr=1e-3,
-    weight_decay=1e-5,
-    epochs=300,
-    patience=50,
-    seed=42,
-):
-    set_seed(seed)
-
+def run_regression_experiment(dataset_dict, args):
+    set_seed(args.seed)
     data = build_pyg_data_from_loader_dict(
-        dataset_dict,
-        device=device,
-        task_type="regression",
+        dataset_dict, device=args.device, task_type="regression"
     )
-
-    results = []
 
     print("=" * 80)
-    print(f"[Regression] Backbone = {backbone}")
+    print(f"[Regression] model={args.model} | backbone={args.backbone}")
     print("=" * 80)
 
-    if baseline:
-        baseline_md = BaselineGNN(
-            in_feats=data.x.size(1),
-            h_feats=hidden_dim,
-            device=device,
-            task_type="regression",
-            name=backbone,
-            dropout=dropout,
-            sgc_k=sgc_k,
+    if args.model == "baseline":
+        md = BaselineGNN(
+            in_feats=data.x.size(1), h_feats=args.hidden_dim,
+            device=args.device, task_type="regression",
+            name=args.backbone, dropout=args.dropout, sgc_k=args.sgc_k,
         )
-        baseline_md.fit(
-            data,
-            epochs=epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            patience=patience,
-            verbose=True,
+        md.fit(data, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+               patience=args.patience, verbose=True)
+
+    elif args.model == "multi":
+        md = FnRGNN(
+            in_feats=data.x.size(1), h_feats=args.hidden_dim,
+            device=args.device, name=args.backbone,
+            dropout=args.dropout, sgc_k=args.sgc_k,
+            drop_edge_rate_struct=args.drop_edge_rate_struct,
+            lambda_fair=args.lambda_fair, warm_up=args.warm_up,
+            ablate_struct=args.ablate_struct,
+            ablate_rep=args.ablate_rep,
+            ablate_out=args.ablate_out,
+            val_tradeoff_mae=args.val_tradeoff_mae,
+            val_tradeoff_bias=args.val_tradeoff_bias,
+            val_tradeoff_mean_pred=args.val_tradeoff_mean_pred,
         )
-        baseline_test = baseline_md.evaluate(data, split="test")
-        results.append({
-            "task": "regression",
-            "model": "Baseline",
-            "backbone": backbone,
-            **baseline_test,
-        })
+        md.fit(data, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+               patience=args.patience, verbose=True)
 
-    fnr = FnRGNN(
-        in_feats=data.x.size(1),
-        h_feats=hidden_dim,
-        device=device,
-        name=backbone,
-        dropout=dropout,
-        sgc_k=sgc_k,
+    elif args.model == "summit":
+        md = SUMMIT_R(
+            in_feats=data.x.size(1), h_feats=args.hidden_dim,
+            device=args.device, name=args.backbone,
+            dropout=args.dropout, sgc_k=args.sgc_k,
+            drop_edge_rate_struct=args.drop_edge_rate_struct,
+            lambda_fair=args.lambda_fair,
+            ablate_struct=args.ablate_struct,
+            ablate_rep=args.ablate_rep,
+            ablate_out=args.ablate_out,
+            val_tradeoff_mae=args.val_tradeoff_mae,
+            val_tradeoff_bias=args.val_tradeoff_bias,
+            val_tradeoff_mean_pred=args.val_tradeoff_mean_pred,
+            sbrs_threshold=args.sbrs_threshold,
+            lam=args.lam,
+            min_weight=args.min_weight,
+            max_weight=args.max_weight,
+            warm_up=args.warm_up,
+            ablate_sbrs=args.ablate_sbrs,
+            ablate_uncertainty=args.ablate_uncertainty,
+        )
+        md.fit(data, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+               patience=args.patience, verbose=True)
 
-        lambda_struct=0.001,
-        lambda_rep=0.01,
-        lambda_out=0.1,
+    else:
+        raise ValueError(f"Unknown model: {args.model}")
 
-        drop_edge_rate_struct=0.1,
-
-        ablate_struct=False,
-        ablate_rep=False,
-        ablate_out=False,
-
-        val_tradeoff_mae=1.0,
-        val_tradeoff_bias=1.0,
-        val_tradeoff_mean_pred=0.5,
-    )
-    fnr.fit(
-        data,
-        epochs=epochs,
-        lr=lr,
-        weight_decay=weight_decay,
-        patience=patience,
-        verbose=True,
-    )
-    fnr_test = fnr.evaluate(data, split="test")
-    results.append({
+    test_result = md.evaluate(data, split="test")
+    return pd.DataFrame([{
         "task": "regression",
-        "model": "FnRGNN",
-        "backbone": backbone,
-        **fnr_test,
-    })
-
-    # ── NAFnRGNN 추가
-    na_fnr = NAFnRGNN(
-        in_feats=data.x.size(1),
-        h_feats=hidden_dim,
-        device=device,
-        name=backbone,
-        dropout=dropout,
-        sgc_k=sgc_k,
-        lambda_struct=0.001,
-        lambda_rep=0.01,
-        lambda_out=0.1,
-        drop_edge_rate_struct=0.1,
-        ablate_struct=False,
-        ablate_rep=False,
-        ablate_out=False,
-        val_tradeoff_mae=1.0,
-        val_tradeoff_bias=1.0,
-        val_tradeoff_mean_pred=0.5,
-
-        # SBRS 파라미터
-        alpha=0.34,
-        beta=0.33,
-        gamma=0.33,
-
-        # 2단계 게이팅 파라미터
-        sbrs_threshold=0.5,
-        lam=1.0,
-        min_weight=0.5,
-        max_weight=2.0,
-        
-        # warm-up / uncertainty 설정
-        warm_up=100,
-        unc_T=10,
-        unc_drop=0.1,
-    )
-    na_fnr.fit(
-        data,
-        epochs=epochs,
-        lr=lr,
-        weight_decay=weight_decay,
-        patience=patience,
-        verbose=True,
-    )
-    na_fnr_test = na_fnr.evaluate(data, split="test")
-    results.append({
-        "task": "regression",
-        "model": "NAFnRGNN",
-        "backbone": backbone,
-        **na_fnr_test,
-    })
-    
-    return pd.DataFrame(results)
+        "model": args.model,
+        "backbone": args.backbone,
+        **test_result,
+    }])
 
 
-# =========================================================
-# Main
-# =========================================================
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--task_type", type=str, required=True, choices=["classification", "regression"], )
-    parser.add_argument("--dataset_name", type=str, required=True, choices=["pokec_z", "pokec_n", "nba", "german"],)
-    parser.add_argument("--sens_attr", type=str, required=True, help="e.g. region / gender / country / Gender",)
-    parser.add_argument("--remove_leakage", action="store_true")\
-    
-    parser.add_argument("--backbone", type=str, required=True, choices=["GCN", "GraphSAGE", "SGC"], )
-    parser.add_argument("--baseline", action="store_true")
+    # ── 필수
+    parser.add_argument("--task_type", type=str, required=True,
+                        choices=["classification", "regression"])
+    parser.add_argument("--dataset_name", type=str, required=True,
+                        choices=["pokec_z", "pokec_n", "nba", "german"])
+    parser.add_argument("--sens_attr", type=str, required=True,
+                        help="e.g. region / gender / country / Gender")
+    parser.add_argument("--backbone", type=str, required=True,
+                        choices=["GCN", "GraphSAGE", "SGC"])
+    parser.add_argument("--model", type=str, required=True,
+                        choices=["baseline", "multi", "summit"])
 
-    parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--hidden_dim", type=int, default=128)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--sgc_k", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    # ── 데이터
+    parser.add_argument("--remove_leakage", action="store_true")
+
+    # ── 모델 구조
+    parser.add_argument("--device",     type=str,   default="cpu")
+    parser.add_argument("--hidden_dim", type=int,   default=128)
+    parser.add_argument("--dropout",    type=float, default=0.1)
+    parser.add_argument("--sgc_k",      type=int,   default=2)
+
+    # ── 학습
+    parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
-    parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--patience", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=27)
-    parser.add_argument("--runs", type=int, default=5, help="runs")
+    parser.add_argument("--epochs",       type=int,   default=1000)
+    parser.add_argument("--patience",     type=int,   default=100)
+    parser.add_argument("--seed",         type=int,   default=27)
+    parser.add_argument("--runs",         type=int,   default=5)
 
+    # ── 분류 val score
+    parser.add_argument("--val_tradeoff_dp",  type=float, default=0.5)
+    parser.add_argument("--val_tradeoff_eo",  type=float, default=0.5)
+
+    # ── 회귀 val score
+    parser.add_argument("--val_tradeoff_mae",       type=float, default=1.0)
+    parser.add_argument("--val_tradeoff_bias",      type=float, default=0.5)
+    parser.add_argument("--val_tradeoff_mean_pred", type=float, default=0.5)
+
+    # ── Fn / NaFn 공통
+    parser.add_argument("--lambda_fair",           type=float, default=0.5)
+    parser.add_argument("--warm_up",               type=int,   default=100)
+    parser.add_argument("--drop_edge_rate_struct",  type=float, default=0.1)
+    parser.add_argument("--ablate_struct", action="store_true")
+    parser.add_argument("--ablate_rep",    action="store_true")
+    parser.add_argument("--ablate_out",    action="store_true")
+
+    # ── NaFn 전용: FIPS 게이팅
+    parser.add_argument("--sbrs_threshold", type=float, default=0.5)
+    parser.add_argument("--lam",            type=float, default=1.0)
+    parser.add_argument("--min_weight",     type=float, default=0.5)
+    parser.add_argument("--max_weight",     type=float, default=2.0)
+
+    # ── NaFn 전용: FIPS ablation
+    parser.add_argument("--ablate_sbrs",        action="store_true", help="Uncertainty only")
+    parser.add_argument("--ablate_uncertainty", action="store_true", help="SBRS only")
 
     return parser.parse_args()
 
@@ -537,34 +319,25 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA requested but not available.")
-
-    if args.weight_decay is None:
-        weight_decay = 0.0 if args.task_type == "classification" else 1e-5
-    else:
-        weight_decay = args.weight_decay
-
-    # seed 목록 생성: args.seed를 시작점으로 runs개 생성
-    seeds = [args.seed + i for i in range(args.runs)]
-
-    all_results = []  # 각 run의 DataFrame을 쌓을 리스트
-
-    for run_idx, seed in enumerate(seeds):
+    all_results = []
+    for run in range(args.runs):
         print(f"\n{'='*80}")
-        print(f"[Run {run_idx+1}/{args.runs}] seed={seed}")
+        print(f"Run {run+1}/{args.runs}")
         print(f"{'='*80}")
 
+        run_args      = argparse.Namespace(**vars(args))
+        run_args.seed = args.seed + run
+
+        # ── load_dataset_from_args는 키워드 인자로 직접 전달
         dataset_dict = load_dataset_from_args(
-            dataset_name=args.dataset_name,
-            task_type=args.task_type,
-            sens_attr=args.sens_attr,
-            remove_leakage=args.remove_leakage,
+            dataset_name   = args.dataset_name,
+            task_type      = args.task_type,
+            sens_attr      = args.sens_attr,
+            remove_leakage = args.remove_leakage,
         )
 
         if args.task_type == "classification":
-            if run_idx == 0:
-                # 첫 run에서만 레이블 분포 출력
+            if run == 0:
                 print("task_type:", args.task_type)
                 print("label dtype:", dataset_dict["labels"].dtype)
                 unique, counts = torch.unique(dataset_dict["labels"], return_counts=True)
@@ -573,76 +346,38 @@ if __name__ == "__main__":
             dataset_dict = prepare_classification_dataset(
                 dataset_dict,
                 train_per_class=500,
-                seed=seed,  # run마다 다른 seed → 다른 split
+                seed=run_args.seed,
             )
 
-            if run_idx == 0:
+            if run == 0:
                 print("[After filtering] train/val/test sizes:",
                       len(dataset_dict["idx_train"]),
                       len(dataset_dict["idx_val"]),
                       len(dataset_dict["idx_test"]))
 
-            result_df = run_classification_experiment(
-                dataset_dict=dataset_dict,
-                device=args.device,
-                backbone=args.backbone,
-                baseline=args.baseline,
-                hidden_dim=args.hidden_dim,
-                dropout=args.dropout,
-                sgc_k=args.sgc_k,
-                lr=args.lr,
-                weight_decay=weight_decay,
-                epochs=args.epochs,
-                patience=args.patience,
-                seed=seed,
-            )
+            df = run_classification_experiment(dataset_dict, run_args)
+
         else:
-            result_df = run_regression_experiment(
-                dataset_dict=dataset_dict,
-                device=args.device,
-                backbone=args.backbone,
-                baseline=args.baseline,
-                hidden_dim=args.hidden_dim,
-                dropout=args.dropout,
-                sgc_k=args.sgc_k,
-                lr=args.lr,
-                weight_decay=weight_decay,
-                epochs=args.epochs,
-                patience=args.patience,
-                seed=seed,
-            )
+            df = run_regression_experiment(dataset_dict, run_args)
 
-        result_df["run"] = run_idx + 1
-        result_df["seed"] = seed
-        all_results.append(result_df)
+        df["run"] = run + 1
+        all_results.append(df)
 
-    # 전체 raw 결과
-    raw_df = pd.concat(all_results, ignore_index=True)
+    final_df = pd.concat(all_results, ignore_index=True)
 
-    # 평균 ± 표준편차 계산
-    metric_cols = [c for c in raw_df.columns if c not in ["task", "model", "backbone", "run", "seed"]]
-    
-    summary_rows = []
-    for (task, model, backbone), group in raw_df.groupby(["task", "model", "backbone"]):
-        row = {"task": task, "model": model, "backbone": backbone}
-        for col in metric_cols:
-            mean = group[col].mean()
-            std  = group[col].std()
-            row[f"{col}_mean"] = round(mean, 4)
-            row[f"{col}_std"]  = round(std, 4)
-            row[col]           = f"{mean:.4f}±{std:.4f}"  # 보기 편한 형식
-        summary_rows.append(row)
+    numeric_cols = final_df.select_dtypes(include="number").columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c != "run"]
 
-    summary_df = pd.DataFrame(summary_rows)
+    summary = final_df.groupby(["task", "model", "backbone"])[numeric_cols].agg(
+        ["mean", "std"]
+    )
+    summary.columns = ["_".join(c) for c in summary.columns]
+    summary = summary.reset_index()
 
-    print("\n[Final Results — Mean ± Std]")
-    # 보기 편한 컬럼만 출력
-    display_cols = ["task", "model", "backbone"] + metric_cols
-    print(summary_df[display_cols].to_string(index=False))
+    print("\n" + "=" * 80)
+    print("Final Results")
+    print("=" * 80)
+    print(summary.to_string(index=False))
 
-    # 저장: raw + summary 둘 다
-    base_name = f"outputs/{args.dataset_name}_{args.task_type}_{args.sens_attr}_runs{args.runs}"
-    raw_df.to_csv(f"{base_name}_raw.csv", index=False)
-    summary_df.to_csv(f"{base_name}_summary.csv", index=False)
-    print(f"\nSaved: {base_name}_raw.csv")
-    print(f"Saved: {base_name}_summary.csv")
+    # ── 저장
+    save_summary(summary, args)

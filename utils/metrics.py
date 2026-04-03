@@ -60,6 +60,7 @@ def classification_fairness_metrics(logits, labels, sens, idx):
     }
 
 
+
 # 회귀 성능
 def regression_metrics(preds, labels):
     """
@@ -84,6 +85,7 @@ def regression_metrics(preds, labels):
     rmse = np.sqrt(mse)
     # 평균 절대 오차 (robust)
     mae = mean_absolute_error(y_true, y_pred)
+    
     # 설명력
     try:
         r2 = r2_score(y_true, y_pred)
@@ -94,7 +96,7 @@ def regression_metrics(preds, labels):
         # "mse": float(mse),
         "rmse": float(rmse),
         "mae": float(mae),
-        "r2": float(r2),
+        # "r2": float(r2),
     }
 
 def regression_fairness_metrics(preds, labels, sens, idx=None):
@@ -183,9 +185,7 @@ def regression_fairness_metrics(preds, labels, sens, idx=None):
         # "mse_gap": _gap(g0["mse"], g1["mse"]),
         "rmse_gap": _gap(g0["rmse"], g1["rmse"]),
         "mae_gap": _gap(g0["mae"], g1["mae"]),
-
-        # 한 집단을 계속 과소/과대 예측하냐
-        "bias_gap": _gap(g0["bias"], g1["bias"]),
+        "bias_gap": _gap(g0["bias"], g1["bias"]),    # 한 집단을 계속 과소/과대 예측하냐
         "mean_pred_gap": _gap(g0["mean_pred"], g1["mean_pred"]),
 
         # bias gap 중복 확인용
@@ -193,6 +193,8 @@ def regression_fairness_metrics(preds, labels, sens, idx=None):
         # "group_0": g0,
         # "group_1": g1,
     }
+
+
 
 # 평가
 def evaluate_pyg_model(model, data, split="val", task_type="classification"):
@@ -219,6 +221,7 @@ def evaluate_pyg_model(model, data, split="val", task_type="classification"):
     if task_type == "classification":
         perf = classification_metrics(out[idx], y[idx])
         fair = classification_fairness_metrics(out, y, s, idx)
+
     elif task_type == "regression":
         perf = regression_metrics(out[idx], y[idx])
         fair = regression_fairness_metrics(out, y, s, idx)
@@ -233,7 +236,6 @@ def evaluate_pyg_model(model, data, split="val", task_type="classification"):
     }
 
     return result
-
 
 
 #### 나중에 보기

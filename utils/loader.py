@@ -5,6 +5,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from pathlib import Path
+from torch_geometric.data import Data
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 
@@ -179,12 +180,8 @@ def _build_symmetric_adj(num_nodes: int, edges: np.ndarray) -> sp.coo_matrix:
     
     return adj.tocoo()
 
-def _load_edges(
-    edge_path: Path,
-    node_ids: np.ndarray,
-    id_col: Optional[str],
-    num_nodes: Optional[int] = None,
-) -> np.ndarray:
+def _load_edges(edge_path: Path, node_ids: np.ndarray, id_col: Optional[str], num_nodes: Optional[int] = None, ) -> np.ndarray:
+    
     edges_unordered = np.genfromtxt(edge_path, dtype=float)
 
     if edges_unordered.size == 0:
