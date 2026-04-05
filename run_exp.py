@@ -29,7 +29,7 @@ def save_summary(summary: pd.DataFrame, args: argparse.Namespace, save_dir: str 
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f"{args.task_type}_{args.dataset_name}.csv")
 
-    # 실험 조건 컬럼 추가
+    # ── 공통 실험 조건
     summary["dataset"]    = args.dataset_name
     summary["sens_attr"]  = args.sens_attr
     summary["runs"]       = args.runs
@@ -38,36 +38,56 @@ def save_summary(summary: pd.DataFrame, args: argparse.Namespace, save_dir: str 
     summary["lambda_fair"] = args.lambda_fair
     summary["warm_up"]    = args.warm_up
 
-    if args.model == "NaFn":
-        summary["sbrs_threshold"]    = args.sbrs_threshold
-        summary["lam"]               = args.lam
-        summary["ablate_sbrs"]       = args.ablate_sbrs
+    # ── multi / gate 공통 추가 조건
+    if args.model in ("multi", "gate"):
+        summary["drop_edge_rate_struct"] = args.drop_edge_rate_struct
+        summary["ablate_struct"]         = args.ablate_struct
+        summary["ablate_rep"]            = args.ablate_rep
+        summary["ablate_out"]            = args.ablate_out
+
+    # ── gate 전용 조건
+    if args.model == "gate":
+        summary["sbrs_threshold"]     = args.sbrs_threshold
+        summary["lam"]                = args.lam
+        summary["min_weight"]         = args.min_weight
+        summary["max_weight"]         = args.max_weight
+        summary["ablate_sbrs"]        = args.ablate_sbrs
         summary["ablate_uncertainty"] = args.ablate_uncertainty
 
-    # 조건 식별 키
+    # ── 조건 식별 키 (모델별로 다름)
     key_cols = ["dataset", "sens_attr", "task", "model", "backbone",
                 "runs", "epochs", "lr", "lambda_fair", "warm_up"]
+
+    if args.model in ("multi", "gate"):
+        key_cols += ["drop_edge_rate_struct",
+                     "ablate_struct", "ablate_rep", "ablate_out"]
+
+    if args.model == "gate":
+        key_cols += ["sbrs_threshold", "lam",
+                     "min_weight", "max_weight",
+                     "ablate_sbrs", "ablate_uncertainty"]
 
     if os.path.exists(save_path):
         existing = pd.read_csv(save_path)
 
-        # 동일 조건 행 제거 후 새 결과 추가
-        merge_keys = [c for c in key_cols if c in existing.columns and c in summary.columns]
-        merged = existing.merge(summary[merge_keys], on=merge_keys, how="left", indicator=True)
-        existing = existing[merged["_merge"] == "left_only"].drop(columns=["_merge"], errors="ignore")
+        merge_keys = [c for c in key_cols
+                      if c in existing.columns and c in summary.columns]
+        merged   = existing.merge(summary[merge_keys], on=merge_keys,
+                                  how="left", indicator=True)
+        existing = existing[
+            merged["_merge"] == "left_only"
+        ].drop(columns=["_merge"], errors="ignore")
 
         final = pd.concat([existing, summary], ignore_index=True)
     else:
         final = summary
 
-    # ── 저장 직전 수치 컬럼 소수점 4자리 반올림
     numeric_cols = final.select_dtypes(include="number").columns
     final[numeric_cols] = final[numeric_cols].round(4)
 
     final.to_csv(save_path, index=False)
     print(f"[Save] {save_path} ({len(final)} rows)")
-
-
+    
 def prepare_classification_dataset(dataset_dict, train_per_class=500, seed=42):
     labels = dataset_dict["labels"].clone()
     labels[labels > 1] = 1
