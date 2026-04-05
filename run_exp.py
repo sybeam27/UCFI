@@ -273,7 +273,7 @@ def parse_args():
 
     # ── 모델 구조
     parser.add_argument("--device",     type=str,   default="cpu")
-    parser.add_argument("--hidden_dim", type=int,   default=128)
+    parser.add_argument("--hidden_dim", type=int,   default=64)
     parser.add_argument("--dropout",    type=float, default=0.1)
     parser.add_argument("--sgc_k",      type=int,   default=2)
 
@@ -283,7 +283,7 @@ def parse_args():
     parser.add_argument("--epochs",       type=int,   default=1000)
     parser.add_argument("--patience",     type=int,   default=100)
     parser.add_argument("--seed",         type=int,   default=27)
-    parser.add_argument("--runs",         type=int,   default=5)
+    parser.add_argument("--runs",         type=int,   default=10)
 
     # ── 분류 val score
     parser.add_argument("--val_tradeoff_dp",  type=float, default=0.5)
@@ -294,8 +294,8 @@ def parse_args():
     parser.add_argument("--val_tradeoff_bias",      type=float, default=0.5)
     parser.add_argument("--val_tradeoff_mean_pred", type=float, default=0.5)
 
-    # ── Fn / NaFn 공통
-    parser.add_argument("--lambda_fair",           type=float, default=0.5)
+    # ── Multi/Gate 공통
+    parser.add_argument("--lambda_fair",           type=float, default=0.1)
     parser.add_argument("--warm_up",               type=int,   default=100)
     parser.add_argument("--drop_edge_rate_struct",  type=float, default=0.1)
     parser.add_argument("--ablate_struct", action="store_true")

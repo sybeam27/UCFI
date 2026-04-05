@@ -1,10 +1,12 @@
 # classification
-python run_exp.py --task_type classification --dataset_name pokec_n --sens_attr region \
-    --remove_leakage \
-    --backbone GCN \
-    --model baseline \
-    --device cuda:1 --runs 10 --lambda_fair 0.1
+# --backbone GCN / SGC / GraphSAGE 
+# --model baseline / multi / gate
 
+python run_exp.py --task_type classification \
+        --remove_leakage  --device cuda:0 \
+        --backbone SGC --model multi \
+        --dataset_name pokec_n --sens_attr region
+        
 
 python run_exp.py --task_type classification --dataset_name pokec_z --sens_attr region
 python run_exp.py --task_type classification --dataset_name pokec_z --sens_attr gender 
@@ -15,11 +17,11 @@ python run_exp.py --task_type classification --dataset_name nba --sens_attr coun
 
 
 # regression
-python run_exp.py --task_type regression --dataset_name pokec_z --sens_attr region \
-    --remove_leakage \
-    --backbone GCN \
-    --model baseline \
-    --device cuda:1 --runs 10
+python run_exp.py --task_type classification \
+        --remove_leakage  --device cuda:0 \
+        --backbone GraphSAGE --model baseline \
+        --dataset_name pokec_n --sens_attr region
+
 
 python run_exp.py --task_type regression --dataset_name pokec_z --sens_attr region
 python run_exp.py --task_type regression --dataset_name pokec_z --sens_attr gender 
