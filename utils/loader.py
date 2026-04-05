@@ -772,12 +772,19 @@ def build_pyg_data_from_loader_dict(dataset_dict, device, task_type="classificat
         raise TypeError("dataset_dict['adj'] must be a scipy sparse matrix.")
 
     adj = adj.tocoo()
+
+    # edge_index = torch.tensor(
+    #     [adj.row, adj.col],
+    #     dtype=torch.long,
+    #     device=device,
+    # )
+    
+    # 빠른 방식
     edge_index = torch.tensor(
-        [adj.row, adj.col],
+        np.array([adj.row, adj.col]),  # list 대신 numpy array로 먼저 변환
         dtype=torch.long,
         device=device,
     )
-
     x = dataset_dict["features"].float().to(device)
 
     if task_type == "classification":

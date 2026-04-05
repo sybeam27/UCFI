@@ -4,24 +4,14 @@ SUMMIT Preliminary Analysis
 논문의 Q1~Q4에 대응하는 분석 코드.
 분류(classification)와 회귀(regression) 모두 지원.
 
-논문 수식과 일치:
-  w_degree(v)   = Norm(log(1 + deg(v)))
-  w_boundary(v) = Norm(|{u in N(v) | s_u != s_v}| / |N(v)|)
-  w_lhd(v)      = Norm(|h_local(v) - h_global|)
-
-불확실성:
-  분류: u(v) = -p_v log p_v - (1-p_v) log(1-p_v)  [이진 엔트로피]
-  회귀: u(v) = 1 / (|yhat_v| + eps)               [예측 절대값 역수]
-
-공정성 지표:
-  분류: parity_gap (Delta_DP), equality_gap (Delta_EO)
-  회귀: pred_gap (Delta_pred),  bias_gap (Delta_bias)
+추가: accuracy, AUC 집계 지원
 """
 
 import numpy as np
 import pandas as pd
 import torch
 from scipy.stats import mannwhitneyu
+from sklearn.metrics import roc_auc_score
 
 
 # =========================================================
@@ -36,18 +26,12 @@ def _minmax_norm(arr):
 
 
 def _compute_fairness_metrics(df, task_type):
-    """
-    분류: parity_gap (Delta_DP), equality_gap (Delta_EO)
-    회귀: pred_gap (Delta_pred),  bias_gap (Delta_bias)
-    """
     m0 = df["sens"] == 0
     m1 = df["sens"] == 1
     nan_r = {"parity_gap": np.nan, "equality_gap": np.nan,
              "pred_gap": np.nan, "bias_gap": np.nan}
-
     if m0.sum() == 0 or m1.sum() == 0:
         return nan_r
-
     if task_type == "classification":
         parity = abs(df.loc[m0, "pred"].mean() - df.loc[m1, "pred"].mean())
         m0y1 = m0 & (df["label"] == 1)
@@ -62,8 +46,8 @@ def _compute_fairness_metrics(df, task_type):
     else:
         pred0 = df.loc[m0, "prob"].astype(float)
         pred1 = df.loc[m1, "prob"].astype(float)
-        y0    = df.loc[m0, "label"].astype(float)
-        y1    = df.loc[m1, "label"].astype(float)
+        y0 = df.loc[m0, "label"].astype(float)
+        y1 = df.loc[m1, "label"].astype(float)
         return {"parity_gap": np.nan, "equality_gap": np.nan,
                 "pred_gap":  float(abs(pred0.mean() - pred1.mean())),
                 "bias_gap":  float(abs((pred0 - y0).mean() - (pred1 - y1).mean()))}
@@ -77,10 +61,8 @@ def _fair_cols(task_type):
 # =========================================================
 # 1. 구조 지표 계산
 # =========================================================
+
 def compute_structural_signals(edge_index, sens, num_nodes):
-    """
-    w_degree, w_boundary, w_lhd 계산 (논문 수식 일치)
-    """
     src = edge_index[0].cpu().numpy()
     dst = edge_index[1].cpu().numpy()
     s   = sens.cpu().numpy().astype(int)
@@ -116,10 +98,11 @@ def compute_structural_signals(edge_index, sens, num_nodes):
 
 
 # =========================================================
-# 2. 분석 테이블 구성
+# 2. 분석 테이블 구성 (accuracy, AUC 포함)
 # =========================================================
+
 @torch.no_grad()
-def build_analysis_table(data, model, struct_df, task_type):
+def build_analysis_table(data, model, struct_df, task_type, split="test"):
     model.eval()
     out = model(data)
     if isinstance(out, tuple):
@@ -143,22 +126,37 @@ def build_analysis_table(data, model, struct_df, task_type):
         error = np.abs(raw - label.astype(float))
         unc   = 1.0 / (np.abs(prob) + 1e-8)
 
-    split = np.array(["other"] * num_nodes, dtype=object)
-    split[data.idx_train.cpu().numpy()] = "train"
-    split[data.idx_val.cpu().numpy()]   = "val"
-    split[data.idx_test.cpu().numpy()]  = "test"
+    split_arr = np.array(["other"] * num_nodes, dtype=object)
+    split_arr[data.idx_train.cpu().numpy()] = "train"
+    split_arr[data.idx_val.cpu().numpy()]   = "val"
+    split_arr[data.idx_test.cpu().numpy()]  = "test"
 
     node_df = pd.DataFrame({
-        "node_id":      np.arange(num_nodes),
-        "split":        split,
-        "label":        label,
-        "pred":         pred,
-        "prob":         prob,
-        "sens":         sens,
-        "error":        error,
-        "uncertainty":  unc.astype(np.float32),
-        "w_uncertainty":_minmax_norm(unc),
+        "node_id":       np.arange(num_nodes),
+        "split":         split_arr,
+        "label":         label,
+        "pred":          pred,
+        "prob":          prob,
+        "sens":          sens,
+        "error":         error,
+        "uncertainty":   unc.astype(np.float32),
+        "w_uncertainty": _minmax_norm(unc),
     })
+
+    # ── Accuracy & AUC (test split 기준)
+    test_mask = (split_arr == split)
+    if task_type == "classification":
+        acc = 1.0 - error[test_mask].mean()
+        try:
+            auc = roc_auc_score(label[test_mask], prob[test_mask])
+        except Exception:
+            auc = np.nan
+    else:
+        acc = np.nan
+        auc = np.nan
+
+    node_df["accuracy"] = acc   # 스칼라 → 전체 컬럼에 동일값
+    node_df["auc"]      = auc
 
     return node_df.merge(
         struct_df[["node_id", "w_degree", "w_boundary", "w_lhd",
@@ -170,12 +168,14 @@ def build_analysis_table(data, model, struct_df, task_type):
 # =========================================================
 # Q1
 # =========================================================
-def analyze_q1(analysis_df, task_type, split="test"):
-    df = analysis_df[analysis_df["split"] == split].copy()
-    overall_s1 = (df["sens"] == 1).mean()
-    fcols = _fair_cols(task_type)
 
-    group_stats = df.groupby("sens").agg(
+def analyze_q1(analysis_df, task_type, split="test"):
+
+    # ── 구조 지표 group_stats: 전체 데이터셋 기준
+    df_all  = analysis_df.copy()
+    overall_s1 = (df_all["sens"] == 1).mean()
+
+    group_stats = df_all.groupby("sens").agg(
         n              =("node_id",        "count"),
         degree_mean    =("degree",         "mean"),
         boundary_mean  =("boundary_ratio", "mean"),
@@ -184,16 +184,22 @@ def analyze_q1(analysis_df, task_type, split="test"):
         w_lhd_mean     =("w_lhd",          "mean"),
     ).reset_index()
 
+    # MW 검정도 전체 기준
     rows = []
     for metric in ["w_degree", "w_boundary", "w_lhd"]:
-        thr = df[metric].quantile(0.90)
-        top = df[df[metric] >= thr].copy()
-        fm  = _compute_fairness_metrics(top, task_type)
+        thr    = df_all[metric].quantile(0.90)
+        top    = df_all[df_all[metric] >= thr].copy()
         top_s1 = (top["sens"] == 1).mean()
-        x0 = df.loc[df["sens"]==0, metric].values
-        x1 = df.loc[df["sens"]==1, metric].values
+        x0 = df_all.loc[df_all["sens"] == 0, metric].values
+        x1 = df_all.loc[df_all["sens"] == 1, metric].values
         mw_p = mannwhitneyu(x0, x1, alternative="two-sided").pvalue \
                if len(x0) > 0 and len(x1) > 0 else np.nan
+
+        # ── 공정성 격차는 test set 기준
+        df_test = analysis_df[analysis_df["split"] == split].copy()
+        top_test = df_test[df_test[metric] >= thr].copy()
+        fm = _compute_fairness_metrics(top_test, task_type)
+
         row = {
             "metric":           metric,
             "threshold_q90":    round(thr, 4),
@@ -203,15 +209,19 @@ def analyze_q1(analysis_df, task_type, split="test"):
             "enrichment":       round(top_s1 / (overall_s1 + 1e-8), 3),
             "mannwhitney_p":    round(mw_p, 4),
         }
+        fcols = _fair_cols(task_type)
         for k in fcols:
             row[k] = round(fm[k], 3) if not np.isnan(fm[k]) else np.nan
         rows.append(row)
 
+    # ── overall fairness는 test set 기준
+    df_test    = analysis_df[analysis_df["split"] == split].copy()
+    overall_fm = _compute_fairness_metrics(df_test, task_type)
+
     return {
         "group_stats":      group_stats,
         "concentration_df": pd.DataFrame(rows),
-        "overall_fairness": {k: round(v, 4) for k, v in
-                             _compute_fairness_metrics(df, task_type).items()
+        "overall_fairness": {k: round(v, 4) for k, v in overall_fm.items()
                              if not np.isnan(v)},
         "overall_s1_ratio": round(overall_s1, 3),
     }
@@ -220,19 +230,20 @@ def analyze_q1(analysis_df, task_type, split="test"):
 # =========================================================
 # Q2
 # =========================================================
+
 def analyze_q2(analysis_df, split="test"):
     df = analysis_df[analysis_df["split"] == split].copy()
     rows = []
     for metric in ["w_degree", "w_boundary", "w_lhd"]:
-        thr  = df[metric].quantile(0.90)
-        high = df[df[metric] >= thr]
-        low  = df[df[metric] <  thr]
+        thr      = df[metric].quantile(0.90)
+        high     = df[df[metric] >= thr]
+        low      = df[df[metric] <  thr]
         high_unc = high["uncertainty"].mean()
         low_unc  = low["uncertainty"].mean()
-        mw_p = mannwhitneyu(high["uncertainty"].values,
-                            low["uncertainty"].values,
-                            alternative="two-sided").pvalue \
-               if len(high) > 0 and len(low) > 0 else np.nan
+        mw_p = mannwhitneyu(
+            high["uncertainty"].values, low["uncertainty"].values,
+            alternative="two-sided"
+        ).pvalue if len(high) > 0 and len(low) > 0 else np.nan
         rows.append({
             "metric":             metric,
             "high_risk_n":        len(high),
@@ -248,6 +259,7 @@ def analyze_q2(analysis_df, split="test"):
 # =========================================================
 # Q3
 # =========================================================
+
 def analyze_q3(analysis_df, task_type, split="test"):
     df = analysis_df[analysis_df["split"] == split].copy()
 
@@ -278,7 +290,7 @@ def analyze_q3(analysis_df, task_type, split="test"):
         fm  = _compute_fairness_metrics(top, task_type)
         row = {"score": label, "n": len(top),
                "error_rate": round(top["error"].mean(), 3),
-               "s1_ratio":   round((top["sens"]==1).mean(), 3)}
+               "s1_ratio":   round((top["sens"] == 1).mean(), 3)}
         for k in fcols:
             row[k] = round(fm[k], 3) if not np.isnan(fm[k]) else np.nan
         rows.append(row)
@@ -286,7 +298,7 @@ def analyze_q3(analysis_df, task_type, split="test"):
     overall_fm = _compute_fairness_metrics(df, task_type)
     row = {"score": "Overall", "n": len(df),
            "error_rate": round(df["error"].mean(), 3),
-           "s1_ratio":   round((df["sens"]==1).mean(), 3)}
+           "s1_ratio":   round((df["sens"] == 1).mean(), 3)}
     for k in fcols:
         row[k] = round(overall_fm[k], 3) if not np.isnan(overall_fm[k]) else np.nan
     rows.append(row)
@@ -299,6 +311,7 @@ def analyze_q3(analysis_df, task_type, split="test"):
 # =========================================================
 # Q4
 # =========================================================
+
 def analyze_q4(analysis_df, task_type, split="test",
                structural_metric="w_boundary"):
     df = analysis_df[analysis_df["split"] == split].copy()
@@ -309,9 +322,9 @@ def analyze_q4(analysis_df, task_type, split="test",
     hu = df["w_uncertainty"]   >= unc_thr
 
     df["group"] = "Other"
-    df.loc[hs & hu,   "group"] = f"High {structural_metric} + High Uncertainty"
-    df.loc[hs & ~hu,  "group"] = f"High {structural_metric} only"
-    df.loc[~hs & hu,  "group"] = "High Uncertainty only"
+    df.loc[hs & hu,  "group"] = f"High {structural_metric} + High Uncertainty"
+    df.loc[hs & ~hu, "group"] = f"High {structural_metric} only"
+    df.loc[~hs & hu, "group"] = "High Uncertainty only"
 
     fcols = _fair_cols(task_type)
     group_order = [
@@ -329,7 +342,7 @@ def analyze_q4(analysis_df, task_type, split="test",
         fm = _compute_fairness_metrics(sub, task_type)
         row = {"group": grp, "n": len(sub),
                "error_rate": round(sub["error"].mean(), 3),
-               "s1_ratio":   round((sub["sens"]==1).mean(), 3)}
+               "s1_ratio":   round((sub["sens"] == 1).mean(), 3)}
         for k in fcols:
             row[k] = round(fm[k], 3) if not np.isnan(fm[k]) else np.nan
         rows.append(row)
@@ -343,18 +356,18 @@ def analyze_q4(analysis_df, task_type, split="test",
 # =========================================================
 # 전체 파이프라인
 # =========================================================
+
 def run_full_analysis(model, data, task_type, split="test", verbose=True):
-    """
-    Q1~Q4 전체 분석.
-    Args:
-        model:     학습된 GNN (공정성 제약 없는 baseline)
-        data:      PyG Data 객체
-        task_type: "classification" | "regression"
-    """
     num_nodes   = data.x.size(0)
     struct_df   = compute_structural_signals(
         data.edge_index, data.sensitive_attr, num_nodes)
-    analysis_df = build_analysis_table(data, model, struct_df, task_type)
+    analysis_df = build_analysis_table(
+        data, model, struct_df, task_type, split=split)
+
+    # ── accuracy, AUC 추출 (test split 기준 단일값)
+    test_row    = analysis_df[analysis_df["split"] == split]
+    acc_val     = test_row["accuracy"].iloc[0] if len(test_row) > 0 else np.nan
+    auc_val     = test_row["auc"].iloc[0]      if len(test_row) > 0 else np.nan
 
     q1 = analyze_q1(analysis_df, task_type, split=split)
     q2 = analyze_q2(analysis_df, split=split)
@@ -367,9 +380,15 @@ def run_full_analysis(model, data, task_type, split="test", verbose=True):
     if verbose:
         _print_results(q1, q2, q3, q4_boundary, task_type)
 
-    return {"struct_df": struct_df, "analysis_df": analysis_df,
-            "q1": q1, "q2": q2, "q3": q3,
-            "q4_boundary": q4_boundary, "q4_lhd": q4_lhd}
+    return {
+        "struct_df":    struct_df,
+        "analysis_df":  analysis_df,
+        "accuracy":     float(acc_val),
+        "auc":          float(auc_val),
+        "q1": q1, "q2": q2, "q3": q3,
+        "q4_boundary":  q4_boundary,
+        "q4_lhd":       q4_lhd,
+    }
 
 
 def _print_results(q1, q2, q3, q4, task_type):

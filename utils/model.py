@@ -493,7 +493,7 @@ def estimate_model_uncertainty(model, data, task_type="classification"):
 
 
 # =========================================================
-# FIPS Node Risk Weights
+# FIW Node Risk Weights
 # =========================================================
 def compute_node_risk_weights(
     data,
@@ -507,7 +507,7 @@ def compute_node_risk_weights(
     ablate_uncertainty=False,
 ):
     """
-    2단계 게이팅 기반 FIPS 노드 가중치.
+    2단계 게이팅 기반 FIW 노드 가중치.
 
     1단계: SBRS >= sbrs_threshold 인 노드만 개입 대상 선정
     2단계: SBRS × (1 + λ·w_unc) 로 최종 가중치 조정
@@ -1022,7 +1022,7 @@ class NodeAwareBase(BaseMultiLevelFairGNN):
 # =========================================================
 # SUMMIT-C / SUMMIT-R
 # =========================================================
-class SUMMIT_C(NodeAwareBase):
+class FairGate_C(NodeAwareBase):
     """
     SUMMIT: Structural risk and Uncertainty-guided
             Multi-level bias MITigation — Classification
@@ -1080,7 +1080,7 @@ class SUMMIT_C(NodeAwareBase):
         eo  = abs(float(val_result.get("eo", 0.0)))
         return acc - self.val_tradeoff_dp * dp - self.val_tradeoff_eo * eo
 
-class SUMMIT_R(NodeAwareBase):
+class FairGate_R(NodeAwareBase):
     """
     SUMMIT: Structural risk and Uncertainty-guided
             Multi-level bias MITigation — Regression

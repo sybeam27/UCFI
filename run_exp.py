@@ -8,8 +8,8 @@ import pandas as pd
 
 from utils.model import (
     BaselineGNN,
-    FnCGNN, SUMMIT_C,
-    FnRGNN, SUMMIT_R,
+    FnCGNN, FairGate_C,
+    FnRGNN, FairGate_R,
 )
 
 from utils.loader import load_dataset_from_args, build_pyg_data_from_loader_dict
@@ -66,7 +66,6 @@ def save_summary(summary: pd.DataFrame, args: argparse.Namespace, save_dir: str 
 
     final.to_csv(save_path, index=False)
     print(f"[Save] {save_path} ({len(final)} rows)")
-
 
 
 def prepare_classification_dataset(dataset_dict, train_per_class=500, seed=42):
@@ -148,8 +147,8 @@ def run_classification_experiment(dataset_dict, args):
         md.fit(data, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
                patience=args.patience, verbose=True)
 
-    elif args.model == "summit":
-        md = SUMMIT_C(
+    elif args.model == "gate":
+        md = FairGate_C(
             in_feats=data.x.size(1), h_feats=args.hidden_dim,
             device=args.device, name=args.backbone,
             dropout=args.dropout, sgc_k=args.sgc_k,
@@ -218,8 +217,8 @@ def run_regression_experiment(dataset_dict, args):
         md.fit(data, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
                patience=args.patience, verbose=True)
 
-    elif args.model == "summit":
-        md = SUMMIT_R(
+    elif args.model == "gate":
+        md = FairGate_R(
             in_feats=data.x.size(1), h_feats=args.hidden_dim,
             device=args.device, name=args.backbone,
             dropout=args.dropout, sgc_k=args.sgc_k,
@@ -267,7 +266,7 @@ def parse_args():
     parser.add_argument("--backbone", type=str, required=True,
                         choices=["GCN", "GraphSAGE", "SGC"])
     parser.add_argument("--model", type=str, required=True,
-                        choices=["baseline", "multi", "summit"])
+                        choices=["baseline", "multi", "gate"])
 
     # ── 데이터
     parser.add_argument("--remove_leakage", action="store_true")
@@ -303,13 +302,13 @@ def parse_args():
     parser.add_argument("--ablate_rep",    action="store_true")
     parser.add_argument("--ablate_out",    action="store_true")
 
-    # ── NaFn 전용: FIPS 게이팅
+    # ── FairGate 전용: FIW 게이팅
     parser.add_argument("--sbrs_threshold", type=float, default=0.5)
     parser.add_argument("--lam",            type=float, default=1.0)
     parser.add_argument("--min_weight",     type=float, default=0.5)
     parser.add_argument("--max_weight",     type=float, default=2.0)
 
-    # ── NaFn 전용: FIPS ablation
+    # ── FairGate 전용: FIW ablation
     parser.add_argument("--ablate_sbrs",        action="store_true", help="Uncertainty only")
     parser.add_argument("--ablate_uncertainty", action="store_true", help="SBRS only")
 
