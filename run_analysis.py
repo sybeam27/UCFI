@@ -172,6 +172,7 @@ def save_results(results, dataset_name, task_type, save_dir="results/analysis"):
 
 def run_dataset_analysis(dataset_name, seed, device, hidden_dim,
                           save_dir, verbose):
+    
     cfg       = DATASET_SETTINGS[dataset_name]
     task_type = cfg["task_type"]
     sens_attr = cfg["sens_attr"]
@@ -190,7 +191,7 @@ def run_dataset_analysis(dataset_name, seed, device, hidden_dim,
         remove_leakage = True,
     )
 
-    if args.task_type == "classification":
+    if task_type == "classification":
         dataset_dict = prepare_classification_dataset(
             dataset_dict,
             train_per_class=label_number,

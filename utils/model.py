@@ -111,6 +111,133 @@ def build_backbone(name, in_feats, h_feats, dropout=0.5, sgc_k=2):
     else:
         raise ValueError(f"Unsupported backbone: {name}")
 
+class BaselineGNN:
+    def __init__(
+        self,
+        in_feats,
+        h_feats,
+        device,
+        task_type="classification",
+        name="GCN",
+        dropout=0.1,
+        sgc_k=2,
+    ):
+        assert task_type in ["classification", "regression"]
+        assert name in ["GCN", "GraphSAGE", "SGC"]
+
+        self.name = f"{name}/Baseline"
+        self.backbone_name = name
+        self.task_type = task_type
+        self.device = device
+
+        self.model = build_backbone(
+            name=name,
+            in_feats=in_feats,
+            h_feats=h_feats,
+            dropout=dropout,
+            sgc_k=sgc_k,
+        ).to(device)
+
+    def _build_optimizer(self, lr, weight_decay):
+        return torch.optim.Adam(
+            self.model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+
+    def _build_criterion(self):
+        if self.task_type == "classification":
+            return nn.BCEWithLogitsLoss()
+        return nn.MSELoss()
+
+    def _compute_val_score(self, val_result):
+        if self.task_type == "classification":
+            return float(val_result.get("acc", 0.0))
+        else:
+            return -float(val_result.get("mae", float("inf")))
+
+    def train_step(self, data, optimizer, criterion):
+        self.model.train()
+        optimizer.zero_grad()
+
+        out = self.model(data).view(-1)
+        labels = data.y.float()
+        idx_train = data.idx_train
+
+        loss = criterion(out[idx_train], labels[idx_train])
+        loss.backward()
+        optimizer.step()
+
+        return {
+            "total_loss": float(loss.item()),
+            "task_loss": float(loss.item()),
+        }
+
+    def fit(
+        self,
+        data,
+        epochs=300,
+        lr=1e-3,
+        weight_decay=0.0,
+        patience=50,
+        verbose=True,
+        print_interval=50,
+    ):
+        optimizer = self._build_optimizer(lr=lr, weight_decay=weight_decay)
+        criterion = self._build_criterion()
+
+        best_val_score = -float("inf")
+        best_state = copy.deepcopy(self.model.state_dict())
+        counter = 0
+
+        for epoch in range(epochs):
+            train_info = self.train_step(data, optimizer, criterion)
+
+            val_result = evaluate_pyg_model(
+                self.model,
+                data,
+                split="val",
+                task_type=self.task_type,
+            )
+            val_score = self._compute_val_score(val_result)
+
+            if val_score > best_val_score:
+                best_val_score = val_score
+                best_state = copy.deepcopy(self.model.state_dict())
+                counter = 0
+            else:
+                counter += 1
+
+            if verbose and (epoch == 0 or (epoch + 1) % print_interval == 0):
+                train_result = evaluate_pyg_model(
+                    self.model,
+                    data,
+                    split="train",
+                    task_type=self.task_type,
+                )
+                print(
+                    f"[{self.name}] "
+                    f"Epoch {epoch+1:04d} | "
+                    f"Loss {train_info['total_loss']:.4f} | "
+                    f"Train {train_result} | "
+                    f"Val {val_result} | "
+                    f"ValScore {val_score:.4f}"
+                )
+
+            if counter >= patience:
+                break
+
+        self.model.load_state_dict(best_state)
+
+    @torch.no_grad()
+    def evaluate(self, data, split="test"):
+        return evaluate_pyg_model(
+            self.model,
+            data,
+            split=split,
+            task_type=self.task_type,
+        )
+
 
 # =========================================================
 # Fairness Loss Functions
@@ -426,7 +553,7 @@ def compute_node_risk_weights(
 # =========================================================
 # Base: BaseMultiLevelFairGNN
 # =========================================================
-class BaselineGNN:
+class BaseMultiLevelFairGNN:
     """
     구조(Structure), 표현(Representation), 출력(Output) 세 레벨
     fairness loss + warm-up 기반 자동 스케일 보정 + 단일 lambda_fair.
@@ -649,7 +776,7 @@ class BaselineGNN:
 # =========================================================
 # FnCGNN / FnRGNN (균일 다단계 공정성)
 # =========================================================
-class FnCGNN(BaselineGNN):
+class FnCGNN(BaseMultiLevelFairGNN):
     """균일 다단계 공정성 개입 - 분류"""
     def __init__(
         self, in_feats, h_feats, device,
@@ -693,7 +820,7 @@ class FnCGNN(BaselineGNN):
         eo  = abs(float(val_result.get("eo", 0.0)))
         return acc - self.val_tradeoff_dp * dp - self.val_tradeoff_eo * eo
 
-class FnRGNN(BaselineGNN):
+class FnRGNN(BaseMultiLevelFairGNN):
     """균일 다단계 공정성 개입 - 회귀"""
     def __init__(
         self, in_feats, h_feats, device,
@@ -745,7 +872,7 @@ class FnRGNN(BaselineGNN):
 # =========================================================
 # NodeAwareBase (FIPS 2단계 게이팅)
 # ========================================================
-class NodeAwareBase(BaselineGNN):
+class NodeAwareBase(BaseMultiLevelFairGNN):
     """
     FIPS 기반 2단계 게이팅 차등 공정성 개입 베이스 클래스.
 
