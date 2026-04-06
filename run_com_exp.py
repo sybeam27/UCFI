@@ -42,7 +42,8 @@ DATASET_SETTINGS = {
     "pokec_z": {"task_type": "classification", "sens_attr": "region"},
     "pokec_n": {"task_type": "classification", "sens_attr": "region"},
     "nba":     {"task_type": "classification", "sens_attr": "country"},
-    "german":  {"task_type": "classification", "sens_attr": "Gender"},
+    "credit":  {"task_type": "classification", "sens_attr": "Age"},
+    "bail":    {"task_type": "classification", "sens_attr": "WHITE"},
 }
 
 

@@ -40,21 +40,6 @@ CLASSIFICATION_DATASET_CONFIGS = {
         "dn": "Pokec_n_Classification",
     },
 
-    "german": {
-        "csv_file": "german.csv",
-        "edge_file": "german_edges.txt",
-        "id_col": None,
-        "predict_attr": "GoodCustomer",
-        "sens_attrs": ["Gender"],
-        "dataset_type": "german_style",
-        "test_idx": None,
-        "label_number": 100,
-        "sens_number": 100,
-        "task_type": "classification",
-        "label_binarize": None,
-        "dn": "German_Classification",
-    },
-
     "nba": {
         "csv_file": "nba.csv",
         "edge_file": "nba_relationship.txt",
@@ -68,6 +53,48 @@ CLASSIFICATION_DATASET_CONFIGS = {
         "task_type": "classification",
         "label_binarize": "greater_than_zero",   # SALARY > 0 -> 1 else 0
         "dn": "NBA_SalaryBinary_Classification",
+    },
+
+    # ------------------------------------------------------------------
+    # Credit Defaulter
+    #   출처: NIFTY (Agarwal et al., UAI 2021)
+    #   파일: credit.csv, credit_edges.txt  → ./data/credit/
+    #   노드: ~30,000  |  sens: Age (binarized)  |  task: NoDefaultNextMonth
+    # ------------------------------------------------------------------
+    "credit": {
+        "csv_file": "credit.csv",
+        "edge_file": "credit_edges.txt",
+        "id_col": None,
+        "predict_attr": "NoDefaultNextMonth",
+        "sens_attrs": ["Age"],
+        "dataset_type": "credit_style",  # Age binarize 전용 처리
+        "test_idx": None,
+        "label_number": 6000,
+        "sens_number": 200,
+        "task_type": "classification",
+        "label_binarize": None,
+        "dn": "Credit_Classification",
+    },
+
+    # ------------------------------------------------------------------
+    # Recidivism (Bail)
+    #   출처: NIFTY (Agarwal et al., UAI 2021)
+    #   파일: bail.csv, bail_edges.txt  → ./data/bail/
+    #   노드: ~18,000  |  sens: WHITE  |  task: bail (0/1)
+    # ------------------------------------------------------------------
+    "bail": {
+        "csv_file": "bail.csv",
+        "edge_file": "bail_edges.txt",
+        "id_col": None,
+        "predict_attr": "bail",
+        "sens_attrs": ["WHITE"],
+        "dataset_type": "bail_style",
+        "test_idx": None,
+        "label_number": 4000,
+        "sens_number": 200,
+        "task_type": "classification",
+        "label_binarize": None,
+        "dn": "Bail_Classification",
     },
 }
 
@@ -114,25 +141,33 @@ REGRESSION_DATASET_CONFIGS = {
         "description": "NBA player performance regression",
     },
     
-    "german": {
-        "csv_file": "german.csv",
-        "edge_file": "german_edges.txt",
+    # Credit / Bail regression variants (필요 시 사용)
+    "credit": {
+        "csv_file": "credit.csv",
+        "edge_file": "credit_edges.txt",
         "id_col": None,
-        "predict_attr": "LoanAmount",
-        "sens_attrs": [
-            "Gender",
-            "ForeignWorker",
-            "Single",
-            "HasTelephone",
-            "OwnsHouse",
-            "Unemployed",
-        ],
-        "dataset_type": "german_style",
+        "predict_attr": "LIMIT_BAL",
+        "sens_attrs": ["Age"],
+        "dataset_type": "credit_style",
         "test_idx": None,
         "label_number": None,
-        "sens_number": None,
+        "sens_number": 200,
         "task_type": "regression",
-        "description": "German loan amount regression",
+        "description": "Credit limit regression",
+    },
+
+    "bail": {
+        "csv_file": "bail.csv",
+        "edge_file": "bail_edges.txt",
+        "id_col": None,
+        "predict_attr": "if_recid",
+        "sens_attrs": ["WHITE"],
+        "dataset_type": "bail_style",
+        "test_idx": None,
+        "label_number": None,
+        "sens_number": 200,
+        "task_type": "regression",
+        "description": "Recidivism score regression",
     },
 }
 
@@ -343,32 +378,35 @@ def _get_dataset_leakage_drop_cols(
             drop |= (nba_mpg_leakage & cols)
 
     # -------------------------
-    # German
+    # Credit Defaulter
     # -------------------------
-    if dataset_name == "german":
-        if task_type == "classification" and predict_attr == "GoodCustomer":
-            german_cls_leakage = {
-                "GoodCustomer",
-                "Risk",
-                "RiskPerformance",
-                "Label",
-                "Target",
-                "Default",
-                "BadCustomer",
+    if dataset_name == "credit":
+        if task_type == "classification" and predict_attr == "NoDefaultNextMonth":
+            credit_cls_leakage = {
+                "NoDefaultNextMonth",
+                "default.payment.next.month",
+                "default_payment_next_month",
             }
-            drop |= (german_cls_leakage & cols)
+            drop |= (credit_cls_leakage & cols)
 
-        if task_type == "regression" and predict_attr == "LoanAmount":
-            german_reg_leakage = {
-                "LoanAmount",
-                "CreditAmount",
-                "Credit",
-                "GoodCustomer",
-                "Risk",
-                "RiskPerformance",
-                "LoanRateAsPercentOfIncome",
+        if task_type == "regression" and predict_attr == "LIMIT_BAL":
+            credit_reg_leakage = {
+                "LIMIT_BAL",
+                "NoDefaultNextMonth",
+                "default.payment.next.month",
             }
-            drop |= (german_reg_leakage & cols)
+            drop |= (credit_reg_leakage & cols)
+
+    # -------------------------
+    # Bail (Recidivism)
+    # -------------------------
+    if dataset_name == "bail":
+        bail_leakage_base = {
+            "bail",
+            "if_recid",
+            "recid",
+        }
+        drop |= (bail_leakage_base & cols)
 
     return sorted(drop)
 
@@ -388,15 +426,15 @@ def _encode_numeric_or_categorical(series: pd.Series) -> np.ndarray:
     return pd.Categorical(series).codes.astype(np.int64)
 
 def _encode_sensitive_attribute(series: pd.Series, dataset_type: str) -> np.ndarray:
-    if dataset_type == "german_style":
-        s = series.copy()
-        if s.dtype == object:
-            s = s.replace({"Female": 1, "Male": 0})
-        if pd.api.types.is_numeric_dtype(s):
-            s = s.to_numpy()
-        else:
-            s = pd.Categorical(s).codes.astype(np.int64)
-        s = np.asarray(s, dtype=np.int64)
+    # Credit: Age는 연속형 → age <= 25 이면 0(young), 초과면 1(old)
+    # NIFTY 논문 기준 binarization
+    if dataset_type == "credit_style":
+        s = series.to_numpy(dtype=np.float32)
+        return (s > 25).astype(np.int64)  # 1 = old (>25), 0 = young (<=25)
+
+    # Bail: WHITE 컬럼은 이미 0/1 binary
+    if dataset_type == "bail_style":
+        s = _encode_numeric_or_categorical(series).astype(np.int64)
         s[s > 0] = 1
         return s
 
@@ -409,9 +447,14 @@ def _encode_classification_labels(
     dataset_type: str,
     label_binarize: Optional[str] = None,
 ) -> np.ndarray:
-    if dataset_type == "german_style":
+    # Credit: NoDefaultNextMonth는 이미 0/1
+    if dataset_type == "credit_style":
         y = series.to_numpy().copy()
-        y[y == -1] = 0
+        return y.astype(np.int64)
+
+    # Bail: bail 컬럼은 이미 0/1
+    if dataset_type == "bail_style":
+        y = series.to_numpy().copy()
         return y.astype(np.int64)
 
     y = _encode_numeric_or_categorical(series)
@@ -460,47 +503,6 @@ def _pokec_style_split(
     sens_idx = set(np.where(sens >= 0)[0].tolist())
     idx_test = np.asarray(list(sens_idx & set(idx_test)), dtype=int)
 
-    idx_sens_train = list(sens_idx - set(idx_val) - set(idx_test))
-    rng.shuffle(idx_sens_train)
-    idx_sens_train = idx_sens_train[:sens_number]
-
-    return (
-        torch.LongTensor(idx_train),
-        torch.LongTensor(idx_val),
-        torch.LongTensor(idx_test),
-        torch.LongTensor(idx_sens_train),
-    )
-
-def _german_style_balanced_split(
-    labels: np.ndarray,
-    label_number: int,
-    sens: np.ndarray,
-    sens_number: int,
-    seed: int,
-):
-    rng = random.Random(seed)
-
-    label_idx_0 = np.where(labels == 0)[0].tolist()
-    label_idx_1 = np.where(labels == 1)[0].tolist()
-    rng.shuffle(label_idx_0)
-    rng.shuffle(label_idx_1)
-
-    idx_train = np.append(
-        label_idx_0[:min(int(0.5 * len(label_idx_0)), label_number // 2)],
-        label_idx_1[:min(int(0.5 * len(label_idx_1)), label_number // 2)],
-    )
-
-    idx_val = np.append(
-        label_idx_0[int(0.5 * len(label_idx_0)):int(0.75 * len(label_idx_0))],
-        label_idx_1[int(0.5 * len(label_idx_1)):int(0.75 * len(label_idx_1))],
-    )
-
-    idx_test = np.append(
-        label_idx_0[int(0.75 * len(label_idx_0)):],
-        label_idx_1[int(0.75 * len(label_idx_1)):],
-    )
-
-    sens_idx = set(np.where(sens >= 0)[0].tolist())
     idx_sens_train = list(sens_idx - set(idx_val) - set(idx_test))
     rng.shuffle(idx_sens_train)
     idx_sens_train = idx_sens_train[:sens_number]
@@ -565,7 +567,7 @@ def load_fairness_dataset(
     분류/회귀 공정성 실험용 통합 데이터셋 로더.
 
     Args:
-        dataset_name: pokec_z, pokec_n, nba, german
+        dataset_name: pokec_z, pokec_n, nba, credit, bail
         root: dataset directory
         task_type: 'classification' or 'regression'
         sens_attr: 사용할 sensitive attribute
@@ -666,13 +668,15 @@ def load_fairness_dataset(
             label_binarize=cfg.get("label_binarize"),
         )
 
-        if dataset_type == "german_style":
-            idx_train, idx_val, idx_test, idx_sens_train = _german_style_balanced_split(
+        if dataset_type in ("credit_style", "bail_style"):
+            # Credit/Bail: 대규모 데이터셋 → pokec_style split 사용
+            idx_train, idx_val, idx_test, idx_sens_train = _pokec_style_split(
                 labels=labels,
-                label_number=label_number,
                 sens=sens,
+                label_number=label_number,
                 sens_number=sens_number,
                 seed=seed,
+                test_idx=False,
             )
         else:
             idx_train, idx_val, idx_test, idx_sens_train = _pokec_style_split(
@@ -727,8 +731,10 @@ def get_dataset_root(dataset_name: str) -> str:
         return "./data/pokec"
     elif dataset_name == "nba":
         return "./data/NBA"
-    elif dataset_name == "german":
-        return "./data/NIFTY"
+    elif dataset_name == "credit":
+        return "./data/credit"
+    elif dataset_name == "bail":
+        return "./data/bail"
     else:
         raise ValueError(f"Unsupported dataset_name: {dataset_name}")
 
@@ -737,8 +743,10 @@ def get_default_sens_attrs(dataset_name: str):
         return ["region", "gender"]
     elif dataset_name == "nba":
         return ["country"]
-    elif dataset_name == "german":
-        return ["Gender"]
+    elif dataset_name == "credit":
+        return ["Age"]
+    elif dataset_name == "bail":
+        return ["WHITE"]
     else:
         raise ValueError(f"Unsupported dataset_name: {dataset_name}")
 

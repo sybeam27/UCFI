@@ -280,7 +280,7 @@ def parse_args():
     parser.add_argument("--task_type", type=str, required=True,
                         choices=["classification", "regression"])
     parser.add_argument("--dataset_name", type=str, required=True,
-                        choices=["pokec_z", "pokec_n", "nba", "german"])
+                        choices=["pokec_z", "pokec_n", "nba", "credit", "bail"])
     parser.add_argument("--sens_attr", type=str, required=True,
                         help="e.g. region / gender / country / Gender")
     parser.add_argument("--backbone", type=str, required=True,

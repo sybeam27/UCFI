@@ -49,7 +49,8 @@ CLS_DATASETS=(
     "pokec_z:gender"
     "pokec_n:gender"
     "nba:country"
-    "german:Gender"
+    "credit:Age"
+    "bail:WHITE"
 )
 
 REG_DATASETS=(
@@ -58,7 +59,8 @@ REG_DATASETS=(
     "pokec_z:gender"
     "pokec_n:gender"
     "nba:country"
-    "german:Gender"
+    "credit:Age"
+    "bail:WHITE"
 )
 
 # ──────────────────────────────────────────────
