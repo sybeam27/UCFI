@@ -1,8 +1,10 @@
 .venv/
 
 data/NBA/
-data/NIFTY/
 data/pokec/
+data/german
+data/bail
+data/credit
 
 ipynb/
 models/
