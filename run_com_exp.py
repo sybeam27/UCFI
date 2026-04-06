@@ -35,7 +35,7 @@ from utils.compare_models import FairGNN, EDITS, FMP, GMMD, NIFTY, FairVGNN
 # =========================================================
 
 ALL_MODELS = ["fairgnn", "edits", "fmp", 
-            #   "gmmd", # 너무 오래 걸림..
+              "gmmd", # 너무 오래 걸림..
               "nifty", "fairvgnn"]
 
 DATASET_SETTINGS = {
